@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AirScan-QR Pro · 接收</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0f172a">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AirScan">
+<link rel="icon" type="image/png" href="icons/favicon-32.png">
 <style>
   :root { --bg:#0f172a; --card:#1e293b; --accent:#7c3aed; --ok:#22c55e; --mut:#94a3b8; }
   * { box-sizing:border-box; }
@@ -57,6 +64,14 @@
 </div>
 
 <script src="../vendor/jsQR.min.js"></script>
+<script>
+// 注册 Service Worker（PWA：可加主屏、离线可用）
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+</script>
 <script type="module">
 import { unpackMeta, unpackData, assembleFile } from "../js/packet.js";
 import { decodeWire } from "../js/wire-codec.js";

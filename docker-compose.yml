@@ -1,0 +1,18 @@
+# AirScan-QR Pro —— 一条命令部署 PWA
+# 电脑（发送端/服务器）执行：docker compose up -d --build
+# 手机和电脑同一 WiFi，浏览器访问（见启动后输出的地址）：
+#   接收：https://<电脑IP>:8443/receiver.html
+#   发送：https://<电脑IP>:8443/sender.html
+services:
+  airscan:
+    build: .
+    image: airscan-qr-pro:latest
+    container_name: airscan-qr-pro
+    ports:
+      - "8443:8443"
+    volumes:
+      - airscan_certs:/certs
+    restart: unless-stopped
+
+volumes:
+  airscan_certs:

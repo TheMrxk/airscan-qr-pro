@@ -12,6 +12,7 @@ key.pem
 # 临时/测速产物
 *.local.*
 /tmp/
+tmp_*.cjs
 *.log
 
 # 系统/编辑器
