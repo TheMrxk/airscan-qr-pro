@@ -1,15 +1,17 @@
 # AirScan-QR Pro —— 一条命令部署 PWA
-# 电脑（发送端/服务器）执行：docker compose up -d --build
-# 手机和电脑同一 WiFi，浏览器访问（见启动后输出的地址）：
-#   接收：https://<电脑IP>:8443/receiver.html
-#   发送：https://<电脑IP>:8443/sender.html
+#
+# 两种使用场景：
+# 1) 公网域名（Cloudflare 反代）：容器映射主机 443，CF SSL 模式设 Full。
+#    用户访问 https://airscan.10v.cc/receiver.html（CF 边缘可信证书，无自签警告）。
+# 2) 局域网直连：用 8443，手机访问 https://<电脑IP>:8443/receiver.html（信任自签证书）。
 services:
   airscan:
     build: .
     image: airscan-qr-pro:latest
     container_name: airscan-qr-pro
     ports:
-      - "8443:8443"
+      - "443:8443"     # Cloudflare Full 回源（标准端口）
+      - "8443:8443"    # 局域网直连备用
     volumes:
       - airscan_certs:/certs
     restart: unless-stopped
