@@ -81,6 +81,11 @@ def build() -> None:
     target.write_text(html, encoding="utf-8")
     print(f"已生成 {target}（{target.stat().st_size // 1024} KB），可双击离线运行")
 
+    # 同步一份到 src/ 作为站点下载入口（nginx 用 attachment 头让浏览器直接下载）
+    site_copy = SRC / "airscan-sender-standalone.html"
+    site_copy.write_text(html, encoding="utf-8")
+    print(f"已同步站点下载副本 {site_copy}")
+
 
 if __name__ == "__main__":
     build()
