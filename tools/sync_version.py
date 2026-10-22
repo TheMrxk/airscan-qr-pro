@@ -33,21 +33,23 @@ def main() -> int:
 
     changed: list[str] = []
 
-    # 1) 两个 HTML 页：替换占位符
+    # 1) 两个 HTML 页：写入版本号（首次替换占位符，之后按 vX.Y.Z 模式原地更新）
+    ver_re = re.compile(r"(data-app-version>\s*)(v\d+\.\d+\.\d+|__APP_VERSION__)(\s*</span>)")
     for name in ("sender.html", "receiver.html"):
         p = SRC / name
         text = p.read_text(encoding="utf-8")
-        if PLACEHOLDER not in text:
-            print(f"! {name} 中没有占位符 {PLACEHOLDER}，跳过")
+        new_text, n = ver_re.subn(rf"\g<1>{version}\g<3>", text)
+        if n == 0:
+            print(f"! {name} 中没有版本占位/标记，跳过")
             continue
-        p.write_text(text.replace(PLACEHOLDER, version), encoding="utf-8")
+        p.write_text(new_text, encoding="utf-8")
         changed.append(f"src/{name}")
 
     # 2) manifest：写 version 字段（保留原有格式与缩进）
     mf = SRC / "manifest.webmanifest"
     mf_text = mf.read_text(encoding="utf-8")
     manifest = json.loads(mf_text)
-    manifest = {"version": version, **manifest}
+    manifest = {**manifest, "version": version}  # 直接覆盖，避免旧值展开后反盖新值
     mf.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

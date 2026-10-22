@@ -33,7 +33,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.1.0</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.1.1</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -43,10 +43,10 @@
 
     <label class="row">② 扫描密度（越低越好扫；先从 V15 试）</label>
     <select id="density">
-      <option value="10">V10 · 约 200B/帧（最稳，慢）</option>
-      <option value="15" selected>V15 · 约 350B/帧（推荐起步）</option>
-      <option value="20">V20 · 约 600B/帧</option>
-      <option value="25">V25 · 约 900B/帧（要求屏幕清晰）</option>
+      <option value="10">V10 · 约 178B/帧（最稳，慢）</option>
+      <option value="15" selected>V15 · 约 364B/帧（推荐起步）</option>
+      <option value="20">V20 · 约 619B/帧</option>
+      <option value="25">V25 · 约 928B/帧（要求屏幕清晰）</option>
     </select>
 
     <label class="row">③ 播放帧率（帧/秒，手机识别跟得上再调高）<span id="fpsv">8</span> fps</label>
@@ -2376,15 +2376,22 @@ var qrcode = function() {
 // 纯 ES Module，可在浏览器与 Node(node:test) 中复用，无任何外部依赖。
 //
 // 设计见《开发文档.md》§4。所有多字节整数小端序(LE)。
-//   MetaFrame : magic(4) | ver(1) | flags(1) | taskId(2) | K(2) | blockSize(2)
+//   MetaFrame : magic(4) | ver(1) | type(1)=1 | flags(1) | taskId(2) | K(2) | blockSize(2)
 //               | fileLen(4) | sha256(32) | nameLen(1) | name(UTF8)
-//   DataFrame : magic(4) | ver(1) | flags(1) | taskId(2) | frameSeq(4)
+//   DataFrame : magic(4) | ver(1) | type(1)=2 | flags(1) | taskId(2) | frameSeq(4)
 //               | payload(...) | crc32(4)
+//
+// type 字段（v2 引入）：META 与 DATA 同魔数，必须靠 type 严格区分，
+// 否则接收端可能把长 DATA 帧误当 META 解析出乱码文件名/假长度（v0.1.0 真机 bug）。
 //
 // M1 阶段 DataFrame.payload = 原始文件分片（无 LT）；M2 起改为 LT 编码包，
 // frameSeq 同时承担去重/进度职责，协议头不变，保证收发兼容。
 const MAGIC = new Uint8Array([0x41, 0x53, 0x51, 0x50]); // "ASQP"
-const PROTO_VER = 1;
+const PROTO_VER = 2;
+
+// 帧类型
+const FRAME_TYPE_META = 1;
+const FRAME_TYPE_DATA = 2;
 
 // flags 位域
 const FLAG_COMPRESS_GZIP = 0x01;
@@ -2433,7 +2440,7 @@ function isMagic(b) {
 }
 
 // ---------- Meta 帧 ----------
-const META_FIXED_LEN = 4 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // 不含 name
+const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+sha256，不含 name
 const META_MAX_NAME = 200;
 function buildMetaFrame(meta) {
   // meta: {taskId, flags, K, blockSize, fileLen, sha256(Uint8Array 32), name(str)}
@@ -2447,6 +2454,7 @@ function buildMetaFrame(meta) {
   const w = new Writer(META_FIXED_LEN + 1 + nameBytes.length);
   w.bytes(MAGIC);
   w.u8(PROTO_VER);
+  w.u8(FRAME_TYPE_META);
   w.u8(meta.flags & 0xff);
   w.u16(meta.taskId & 0xffff);
   w.u16(meta.K & 0xffff);
@@ -2463,6 +2471,8 @@ function parseMetaFrame(buf) {
   const r = new Reader(buf);
   r.bytes(4); // magic
   const ver = r.u8();
+  const type = r.u8();
+  if (type !== FRAME_TYPE_META) return null; // 严格拒绝 DATA 帧误当 META
   const flags = r.u8();
   const taskId = r.u16();
   const K = r.u16();
@@ -2472,19 +2482,34 @@ function parseMetaFrame(buf) {
   const nameLen = r.u8();
   if (r.left < nameLen) return null;
   const nameBytes = r.bytes(nameLen);
-  const name = new TextDecoder().decode(nameBytes);
-  return { ver, flags, taskId, K, blockSize, fileLen, sha256, name };
+  let name;
+  try {
+    name = new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
+  } catch {
+    return null; // 非法 UTF-8 文件名，不是合法 META
+  }
+  // 合理性校验：挡掉损坏/伪造帧解出的离谱元数据
+  if (K < 1 || blockSize < 1 || blockSize > 4096 || fileLen > 256 * 1024 * 1024) return null;
+  return { ver, type, flags, taskId, K, blockSize, fileLen, sha256, name };
 }
 
 // ---------- Data 帧 ----------
-const DATA_HDR_LEN = 4 + 1 + 1 + 2 + 4; // magic+ver+flags+taskId+frameSeq
+const DATA_HDR_LEN = 4 + 1 + 1 + 1 + 2 + 4; // magic+ver+type+flags+taskId+frameSeq
 const DATA_CRC_LEN = 4;
+
+// 快速读取帧类型（magic4 + ver1 后的第 1 字节）；非法/过短返回 0。
+// 接收端用它在不解 CRC 的前提下分流 META / DATA。
+function peekFrameType(buf) {
+  if (!buf || buf.length < 6 || !isMagic(buf)) return 0;
+  return buf[5];
+}
 function buildDataFrame(d) {
   // d: {flags, taskId, frameSeq, payload(Uint8Array)}
   const payload = d.payload || new Uint8Array(0);
   const w = new Writer(DATA_HDR_LEN + payload.length + DATA_CRC_LEN);
   w.bytes(MAGIC);
   w.u8(PROTO_VER);
+  w.u8(FRAME_TYPE_DATA);
   w.u8(d.flags & 0xff);
   w.u16(d.taskId & 0xffff);
   w.u32(d.frameSeq >>> 0);
@@ -2493,21 +2518,23 @@ function buildDataFrame(d) {
   return w.out;
 }
 
-// 返回 {ver,flags,taskId,frameSeq,payload,crcOk} 或 null（非有效帧/CRC失败）
+// 返回 {ver,type,flags,taskId,frameSeq,payload,crcOk} 或 null（非有效帧/CRC失败）
 function parseDataFrame(buf) {
   if (!isMagic(buf)) return null;
   if (buf.length < DATA_HDR_LEN + DATA_CRC_LEN) return null;
   const r = new Reader(buf);
   r.bytes(4);
   const ver = r.u8();
+  const type = r.u8();
+  if (type !== FRAME_TYPE_DATA) return null; // 严格拒绝 META 帧误当 DATA
   const flags = r.u8();
   const taskId = r.u16();
   const frameSeq = r.u32();
   const payload = r.bytes(buf.length - DATA_HDR_LEN - DATA_CRC_LEN);
   const crcGiven = r.u32();
   const crcOk = crcGiven === crc32(payload);
-  if (!crcOk) return { ver, flags, taskId, frameSeq, payload, crcOk: false };
-  return { ver, flags, taskId, frameSeq, payload, crcOk: true };
+  if (!crcOk) return { ver, type, flags, taskId, frameSeq, payload, crcOk: false };
+  return { ver, type, flags, taskId, frameSeq, payload, crcOk: true };
 }
 
 // ---------- 分片（M1：定长，最后一块不补齐；接收端按 frameSeq 重组） ----------
@@ -2558,12 +2585,35 @@ const RAW_CAPACITY = {
 };
 const EC_INDEX = { L: 0, M: 1, Q: 2, H: 3 };
 
+// 某版本/纠错级的 QR Byte 模式原始字节容量
+function rawQrCapacity(version, ecLevel = "L") {
+  const row = RAW_CAPACITY[version];
+  if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
+  return row[EC_INDEX[ecLevel]];
+}
+
 // QR 内可承载的【数据帧 payload】安全上限 = 字节容量 - 帧头 - CRC。
+// 注意：这是"二进制帧字节"口径，未经 wire(base64)。发送端选 blockSize 必须
+// 用 wirePayloadCapacity（把 base64 膨胀算进去），否则编码后超 QR 容量，
+// qrcode-generator 静默容错产坏码 → 接收端 CRC 失败（v0.1.0 真机丢包根因之一）。
 function qrPayloadCapacity(version, ecLevel = "L") {
   const row = RAW_CAPACITY[version];
   if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
   const raw = row[EC_INDEX[ecLevel]];
   return Math.max(0, raw - DATA_HDR_LEN - DATA_CRC_LEN);
+}
+
+// wire 文本（ASQP2.<base64整帧>.E）用 QR Byte 模式承载，字符数=字节数。
+// 给定 QR 版本，反推"单帧净 payload"最多多少字节，确保最终 wire 文本不超容量。
+// 预留 2 字节安全余量。
+function wirePayloadCapacity(version, ecLevel = "L") {
+  const row = RAW_CAPACITY[version];
+  if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
+  // wire 长度 = 前缀6 + base64(4*ceil(frameBytes/3)) + 后缀2
+  const b64Budget = row[EC_INDEX[ecLevel]] - 2 - 8; // 扣余量与前后缀
+  const maxFrameBytes = Math.floor(b64Budget / 4) * 3; // base64 长度按 4 向上取整
+  const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
+  return Math.max(0, maxFrameBytes - fixed);
 }
 
 // M1 选档：给定 payload 需求字节，返回 {version, ec, capacity, blockSize}，
@@ -2739,11 +2789,12 @@ function chooseQrProfileForScan(version = 25, ecLevel = "L") {
 // 故网页链路在 QR 边界统一做 Base64；P4 客户端(zbar 原始字节)可跳过本层（enc=raw）。
 //
 // 为让接收端能从一帧扫码文本里稳定切出 payload，每条扫码行用前缀/帧界定：
-//   "ASQP1." + base64(payload) + ".E"
-// 前缀含协议魔数与版本；base64 字符集不含 '.'，故 '.' 可作安全定界。
+//   "ASQP2." + base64(payload) + ".E"
+// 前缀含协议魔数与协议大版本（PROTO_VER=2）；base64 字符集不含 '.'，故 '.' 可作安全定界。
+// v1 前缀 ASQP1. 为 v0.1.0 旧帧（无 type 字段，有 meta/data 误锁 bug），直接不识别。
 
 
-const PREFIX = "ASQP1."; // MAGIC ASCII("ASQP") + 协议版本1 + '.'
+const PREFIX = "ASQP2."; // MAGIC ASCII("ASQP") + 协议版本2 + '.'
 const SUFFIX = ".E";
 
 function bytesToB64(u8) {
@@ -2819,10 +2870,10 @@ $("start").addEventListener("click", async () => {
   } else { return err("请选择文件或输入文本"); }
 
   const version = parseInt($("density").value, 10);
-  // 单帧原始帧字节上限 = QR byte容量；wire(base64)后文本要能放进同版本 QR，
-  // 这里把块大小按 base64 膨胀(4/3)反推，确保最终编码不超容量。
-  const byteCap = qrPayloadCapacity(version, "L");
-  const blockSize = Math.floor((byteCap - 20) * 3 / 4); // 留帧头余量，再反base64膨胀
+  // 用精确容量反推 blockSize：wire 文本 = ASQP2. + base64(整帧) + .E，
+  // 必须整段放进所选版本 QR，qrcode-generator 超长不报错只会产坏码。
+  const blockSize = wirePayloadCapacity(version, "L");
+  if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
     packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff) });
   } catch (e) { return err("打包失败：" + e.message); }
@@ -2830,6 +2881,14 @@ $("start").addEventListener("click", async () => {
   // 播放序列：META 周期性插播 + 数据帧循环（M1 顺序轮播，靠重扫容错）
   const metaWire = encodeWire(packed.metaFrame);
   const dataWires = packed.dataFrames.map(fr => encodeWire(fr));
+
+  // 越界硬校验：任一帧 wire 文本超过该 QR 容量直接报错，绝不播放坏码
+  const cap = rawQrCapacity(version, "L");
+  const over = [metaWire, ...dataWires].filter(t => t.length > cap);
+  if (over.length) {
+    return err(`编码越界：${over.length} 帧超过 V${version}-L 容量 ${cap}（最长 ${Math.max(...over.map(t=>t.length))}），请降密度`);
+  }
+
   playlist = [{ text: metaWire, type: "META", seq: -1 },
               ...dataWires.map((t, i) => ({ text: t, type: "DATA", seq: i }))];
 
@@ -2858,7 +2917,7 @@ function drawFrame() {
 
 function paint(qr) {
   const cv = $("player"), ctx = cv.getContext("2d");
-  const n = qr.getModuleCount(), margin = 3, cell = Math.floor(cv.width / (n + margin * 2));
+  const n = qr.getModuleCount(), margin = 4, cell = Math.floor(cv.width / (n + margin * 2));
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.fillStyle = "#000";
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)

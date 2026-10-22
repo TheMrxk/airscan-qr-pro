@@ -21,6 +21,20 @@
   .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
   video { width:100%; border-radius:12px; background:#000; display:none; }
   canvas.hidden { display:none; }
+  /* 取景器：视频容器内叠一个方形瞄准框，引导把二维码放进框里 */
+  .view { position:relative; width:100%; display:none; }
+  .view video { display:block; width:100%; }
+  .reticle {
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    width:78%; aspect-ratio:1/1; pointer-events:none;
+    border:2px solid rgba(124,58,237,.9); border-radius:16px;
+    box-shadow:0 0 0 9999px rgba(0,0,0,.28);
+  }
+  .reticle::before { content:""; position:absolute; inset:-2px; border-radius:16px;
+    border:3px dashed rgba(255,255,255,.55); animation:none; }
+  .reticle.good { border-color:#22c55e; }
+  .hint { position:absolute; left:0; right:0; bottom:10px; text-align:center;
+    color:#fff; font-size:12px; text-shadow:0 1px 3px rgba(0,0,0,.8); pointer-events:none; }
   button { font-size:14px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; padding:12px 16px; cursor:pointer; width:100%; }
   button.primary { background:var(--accent); border-color:var(--accent); font-weight:700; }
   .bar { background:#0f172a; border-radius:999px; height:14px; overflow:hidden; margin:8px 0; }
@@ -35,11 +49,15 @@
 <body>
 <div class="wrap">
   <h1>📥 AirScan-QR Pro · 接收端</h1>
-  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.1.0</span></div>
+  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.1.1</span></div>
 
   <div class="card">
     <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
-    <video id="video" playsinline muted></video>
+    <div class="view" id="view">
+      <video id="video" playsinline muted></video>
+      <div class="reticle" id="reticle"></div>
+      <div class="hint" id="camHint">把二维码整个放进方框，保持稳定</div>
+    </div>
     <canvas class="hidden" id="canvas"></canvas>
   </div>
 
@@ -75,11 +93,13 @@ if ("serviceWorker" in navigator) {
 <script type="module">
 import { unpackMeta, unpackData, assembleFile } from "../js/packet.js";
 import { decodeWire } from "../js/wire-codec.js";
+import { peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA } from "../js/protocol.js";
 
 const $ = (id) => document.getElementById(id);
 let stream = null, raf = null, meta = null;
 const blocks = new Map();   // frameSeq -> payload
 let badCrc = 0, scans = 0, lastFpsT = performance.now();
+let lockHit = false;        // 取景框绿框反馈节流
 
 $("startCam").addEventListener("click", async () => {
   try {
@@ -88,9 +108,10 @@ $("startCam").addEventListener("click", async () => {
       audio: false,
     });
     const v = $("video");
-    v.srcObject = stream; v.style.display = "block";
+    v.srcObject = stream;
     await v.play();
     $("startCam").style.display = "none";
+    $("view").style.display = "block";
     loop();
   } catch (e) {
     $("phase").textContent = "无法打开摄像头：" + e.message + "（需 HTTPS 或 localhost）";
@@ -101,12 +122,18 @@ function loop() {
   const v = $("video"), cv = $("canvas"), ctx = cv.getContext("2d", { willReadFrequently: true });
   const w = v.videoWidth, h = v.videoHeight;
   if (w && h) {
-    cv.width = w; cv.height = h;
-    ctx.drawImage(v, 0, 0, w, h);
+    // 中心方形 ROI：只裁取景框区域送 jsQR，大幅降低解码像素数、提速、抗背景干扰。
+    // 与 CSS 瞄准框 78% 宽度对齐（留余量取 82%，防止手抖出框）。
+    const side = Math.round(Math.min(w, h) * 0.82);
+    const sx = Math.round((w - side) / 2);
+    const sy = Math.round((h - side) / 2);
+    cv.width = side; cv.height = side;
+    ctx.drawImage(v, sx, sy, side, side, 0, 0, side, side);
     scans++;
-    const img = ctx.getImageData(0, 0, w, h);
-    const res = jsQR(img.data, w, h, { inversionAttempts: "dontInvert" });
-    if (res && res.data) handleText(res.data);
+    const img = ctx.getImageData(0, 0, side, side);
+    const res = jsQR(img.data, side, side, { inversionAttempts: "dontInvert" });
+    if (res && res.data) { handleText(res.data); flashReticle(true); }
+    else flashReticle(false);
     // fps
     const now = performance.now();
     if (now - lastFpsT > 1000) {
@@ -117,18 +144,35 @@ function loop() {
   raf = requestAnimationFrame(loop);
 }
 
+function flashReticle(good) {
+  const el = $("reticle");
+  el.classList.toggle("good", good);
+}
+
 function handleText(text) {
   // 同一条线里可能含一个帧；decodeWire 截取首个完整帧
   const frame = decodeWire(text);
   if (!frame) return;
 
-  // 尚未锁定任务：任何帧都先试 meta
+  // 按帧类型严格分流，杜绝 DATA 误当 META（v0.1.0 真机乱码根因）
+  const type = peekFrameType(frame);
+
+  // 尚未锁定任务：只接受 META
   if (!meta) {
+    if (type !== FRAME_TYPE_META) {
+      $("phase").textContent = "发现二维码，等待 META 帧…";
+      return;
+    }
     const m = unpackMeta(frame);
-    if (m && m.ver >= 1) { lockMeta(m); return; }
-    $("phase").textContent = "发现二维码，等待 META 帧…";
+    if (m && m.ver >= 2) { lockMeta(m); }
+    else $("phase").textContent = "发现二维码，等待 META 帧…";
     return;
   }
+
+  // 已锁定：META 帧重复广播时忽略（也可在此支持任务切换，M1 先锁定首个）
+  if (type === FRAME_TYPE_META) return;
+  if (type !== FRAME_TYPE_DATA) return;
+
   const d = unpackData(frame);
   if (!d) { badCrc++; $("bad").textContent = badCrc; return; }
   if (d.taskId !== meta.taskId) return;       // 别的任务，忽略
@@ -140,11 +184,19 @@ function handleText(text) {
   }
 }
 
+function fmtSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + "MB";
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + "KB";
+  return bytes + "B";
+}
+
 function lockMeta(m) {
-  meta = m; blocks.clear();
+  meta = m; blocks.clear(); badCrc = 0;
   $("phase").textContent = "已锁定任务，收集数据帧…";
-  $("task").textContent = `${m.name} · ${(m.fileLen/1024).toFixed(1)}KB · ${m.K} 块 · ${m.flags & 1 ? "gzip" : "raw"}`;
+  const safeName = m.name || "(未命名)";
+  $("task").textContent = `${safeName} · ${fmtSize(m.fileLen)} · ${m.K} 块 · ${m.flags & 1 ? "gzip" : "raw"}`;
   $("total").textContent = m.K;
+  $("camHint").textContent = "保持对准，绿色方框表示已识别";
   refresh();
 }
 

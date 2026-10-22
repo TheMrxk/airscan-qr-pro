@@ -2,14 +2,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { encodeWire, decodeWire, wireTextLen } from "../src/js/wire-codec.js";
-import { buildDataFrame, buildMetaFrame, MAGIC } from "../src/js/protocol.js";
+import { buildDataFrame, buildMetaFrame, parseMetaFrame, parseDataFrame, FRAME_TYPE_META, FRAME_TYPE_DATA } from "../src/js/protocol.js";
 
 test("含0x00/高字节的数据帧：wire往返字节完全一致", () => {
   const payload = new Uint8Array(900);
   for (let i = 0; i < 900; i++) payload[i] = (i * 37 + 11) % 256; // 含0和255
   const frame = buildDataFrame({ flags: 1, taskId: 9, frameSeq: 777, payload });
   const text = encodeWire(frame);
-  assert.ok(text.startsWith("ASQP1."));
+  assert.ok(text.startsWith("ASQP2."));
   assert.ok(text.endsWith(".E"));
   assert.doesNotMatch(text, /[^\x20-\x7e]/, "wire 文本应全为可打印 ASCII");
   const back = decodeWire(text);
@@ -32,9 +32,45 @@ test("从带噪声/空白的扫码文本中提取帧", () => {
 
 test("非本协议文本返回 null", () => {
   assert.equal(decodeWire("https://example.com"), null);
-  assert.equal(decodeWire("ASQP1.@@@notbase64.E"), null);
+  assert.equal(decodeWire("ASQP2.@@@notbase64.E"), null);
+  assert.equal(decodeWire("ASQP1.AAA=.E"), null); // v1 旧帧（无type字段）必须拒绝
   assert.equal(decodeWire(""), null);
   assert.equal(decodeWire(null), null);
+});
+
+test("【v2回归】DATA 帧绝不被当作 META 解析（v0.1.0 真机乱码根因）", () => {
+  // 构造一个很长的 DATA 帧（payload 远超 META 固定长度，最容易被误读）
+  const payload = new Uint8Array(900);
+  for (let i = 0; i < 900; i++) payload[i] = (i * 37 + 11) % 256;
+  const dataFrame = buildDataFrame({ flags: 1, taskId: 1234, frameSeq: 5, payload });
+  assert.equal(parseMetaFrame(dataFrame), null, "DATA 帧 parseMetaFrame 必须返回 null");
+  const d = parseDataFrame(dataFrame);
+  assert.equal(d.crcOk, true);
+  assert.equal(d.type, FRAME_TYPE_DATA);
+
+  // 反向：META 帧不能被当 DATA
+  const sha = new Uint8Array(32).fill(0x7f);
+  const metaFrame = buildMetaFrame({ taskId: 1, flags: 0, K: 3, blockSize: 900, fileLen: 2000, sha256: sha, name: "a.bin" });
+  assert.equal(parseDataFrame(metaFrame), null, "META 帧 parseDataFrame 必须返回 null");
+  const m = parseMetaFrame(metaFrame);
+  assert.equal(m.type, FRAME_TYPE_META);
+  assert.equal(m.name, "a.bin");
+});
+
+test("【v2回归】损坏/伪造 META（离谱长度、非法UTF8名）被拒绝", () => {
+  const sha = new Uint8Array(32).fill(0x7f);
+  assert.equal(parseMetaFrame(buildMetaFrame({ taskId: 1, flags: 0, K: 0, blockSize: 900, fileLen: 2000, sha256: sha, name: "a.bin" })), null, "K=0 拒绝");
+  assert.equal(parseMetaFrame(buildMetaFrame({ taskId: 1, flags: 0, K: 3, blockSize: 999999, fileLen: 2000, sha256: sha, name: "a.bin" })), null, "blockSize 离谱拒绝");
+});
+
+test("wirePayloadCapacity 反推的 blockSize 编码后不超 QR 容量", async () => {
+  const { wirePayloadCapacity, rawQrCapacity, buildDataFrame } = await import("../src/js/protocol.js");
+  for (const v of [10, 15, 20, 25]) {
+    const bs = wirePayloadCapacity(v, "L");
+    const frame = buildDataFrame({ flags: 1, taskId: 1, frameSeq: 0, payload: new Uint8Array(bs) });
+    const text = encodeWire(frame);
+    assert.ok(text.length <= rawQrCapacity(v, "L"), `V${v}: wire ${text.length} > 容量 ${rawQrCapacity(v,"L")}`);
+  }
 });
 
 test("wireTextLen 为 base64 膨胀+定界长度", () => {

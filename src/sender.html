@@ -36,7 +36,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.1.0</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.1.1</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -46,10 +46,10 @@
 
     <label class="row">② 扫描密度（越低越好扫；先从 V15 试）</label>
     <select id="density">
-      <option value="10">V10 · 约 200B/帧（最稳，慢）</option>
-      <option value="15" selected>V15 · 约 350B/帧（推荐起步）</option>
-      <option value="20">V20 · 约 600B/帧</option>
-      <option value="25">V25 · 约 900B/帧（要求屏幕清晰）</option>
+      <option value="10">V10 · 约 178B/帧（最稳，慢）</option>
+      <option value="15" selected>V15 · 约 364B/帧（推荐起步）</option>
+      <option value="20">V20 · 约 619B/帧</option>
+      <option value="25">V25 · 约 928B/帧（要求屏幕清晰）</option>
     </select>
 
     <label class="row">③ 播放帧率（帧/秒，手机识别跟得上再调高）<span id="fpsv">8</span> fps</label>
@@ -77,7 +77,7 @@
 <script type="module">
 import { packFile } from "../js/packet.js";
 import { encodeWire } from "../js/wire-codec.js";
-import { qrPayloadCapacity } from "../js/protocol.js";
+import { wirePayloadCapacity, rawQrCapacity } from "../js/protocol.js";
 
 const $ = (id) => document.getElementById(id);
 let timer = null, packed = null, playlist = [], cursor = 0;
@@ -100,10 +100,10 @@ $("start").addEventListener("click", async () => {
   } else { return err("请选择文件或输入文本"); }
 
   const version = parseInt($("density").value, 10);
-  // 单帧原始帧字节上限 = QR byte容量；wire(base64)后文本要能放进同版本 QR，
-  // 这里把块大小按 base64 膨胀(4/3)反推，确保最终编码不超容量。
-  const byteCap = qrPayloadCapacity(version, "L");
-  const blockSize = Math.floor((byteCap - 20) * 3 / 4); // 留帧头余量，再反base64膨胀
+  // 用精确容量反推 blockSize：wire 文本 = ASQP2. + base64(整帧) + .E，
+  // 必须整段放进所选版本 QR，qrcode-generator 超长不报错只会产坏码。
+  const blockSize = wirePayloadCapacity(version, "L");
+  if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
     packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff) });
   } catch (e) { return err("打包失败：" + e.message); }
@@ -111,6 +111,14 @@ $("start").addEventListener("click", async () => {
   // 播放序列：META 周期性插播 + 数据帧循环（M1 顺序轮播，靠重扫容错）
   const metaWire = encodeWire(packed.metaFrame);
   const dataWires = packed.dataFrames.map(fr => encodeWire(fr));
+
+  // 越界硬校验：任一帧 wire 文本超过该 QR 容量直接报错，绝不播放坏码
+  const cap = rawQrCapacity(version, "L");
+  const over = [metaWire, ...dataWires].filter(t => t.length > cap);
+  if (over.length) {
+    return err(`编码越界：${over.length} 帧超过 V${version}-L 容量 ${cap}（最长 ${Math.max(...over.map(t=>t.length))}），请降密度`);
+  }
+
   playlist = [{ text: metaWire, type: "META", seq: -1 },
               ...dataWires.map((t, i) => ({ text: t, type: "DATA", seq: i }))];
 
@@ -139,7 +147,7 @@ function drawFrame() {
 
 function paint(qr) {
   const cv = $("player"), ctx = cv.getContext("2d");
-  const n = qr.getModuleCount(), margin = 3, cell = Math.floor(cv.width / (n + margin * 2));
+  const n = qr.getModuleCount(), margin = 4, cell = Math.floor(cv.width / (n + margin * 2));
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.fillStyle = "#000";
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)

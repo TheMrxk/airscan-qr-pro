@@ -2,16 +2,23 @@
 // 纯 ES Module，可在浏览器与 Node(node:test) 中复用，无任何外部依赖。
 //
 // 设计见《开发文档.md》§4。所有多字节整数小端序(LE)。
-//   MetaFrame : magic(4) | ver(1) | flags(1) | taskId(2) | K(2) | blockSize(2)
+//   MetaFrame : magic(4) | ver(1) | type(1)=1 | flags(1) | taskId(2) | K(2) | blockSize(2)
 //               | fileLen(4) | sha256(32) | nameLen(1) | name(UTF8)
-//   DataFrame : magic(4) | ver(1) | flags(1) | taskId(2) | frameSeq(4)
+//   DataFrame : magic(4) | ver(1) | type(1)=2 | flags(1) | taskId(2) | frameSeq(4)
 //               | payload(...) | crc32(4)
+//
+// type 字段（v2 引入）：META 与 DATA 同魔数，必须靠 type 严格区分，
+// 否则接收端可能把长 DATA 帧误当 META 解析出乱码文件名/假长度（v0.1.0 真机 bug）。
 //
 // M1 阶段 DataFrame.payload = 原始文件分片（无 LT）；M2 起改为 LT 编码包，
 // frameSeq 同时承担去重/进度职责，协议头不变，保证收发兼容。
 
 export const MAGIC = new Uint8Array([0x41, 0x53, 0x51, 0x50]); // "ASQP"
-export const PROTO_VER = 1;
+export const PROTO_VER = 2;
+
+// 帧类型
+export const FRAME_TYPE_META = 1;
+export const FRAME_TYPE_DATA = 2;
 
 // flags 位域
 export const FLAG_COMPRESS_GZIP = 0x01;
@@ -61,7 +68,7 @@ function isMagic(b) {
 }
 
 // ---------- Meta 帧 ----------
-export const META_FIXED_LEN = 4 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // 不含 name
+export const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+sha256，不含 name
 export const META_MAX_NAME = 200;
 
 export function buildMetaFrame(meta) {
@@ -76,6 +83,7 @@ export function buildMetaFrame(meta) {
   const w = new Writer(META_FIXED_LEN + 1 + nameBytes.length);
   w.bytes(MAGIC);
   w.u8(PROTO_VER);
+  w.u8(FRAME_TYPE_META);
   w.u8(meta.flags & 0xff);
   w.u16(meta.taskId & 0xffff);
   w.u16(meta.K & 0xffff);
@@ -93,6 +101,8 @@ export function parseMetaFrame(buf) {
   const r = new Reader(buf);
   r.bytes(4); // magic
   const ver = r.u8();
+  const type = r.u8();
+  if (type !== FRAME_TYPE_META) return null; // 严格拒绝 DATA 帧误当 META
   const flags = r.u8();
   const taskId = r.u16();
   const K = r.u16();
@@ -102,13 +112,27 @@ export function parseMetaFrame(buf) {
   const nameLen = r.u8();
   if (r.left < nameLen) return null;
   const nameBytes = r.bytes(nameLen);
-  const name = new TextDecoder().decode(nameBytes);
-  return { ver, flags, taskId, K, blockSize, fileLen, sha256, name };
+  let name;
+  try {
+    name = new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
+  } catch {
+    return null; // 非法 UTF-8 文件名，不是合法 META
+  }
+  // 合理性校验：挡掉损坏/伪造帧解出的离谱元数据
+  if (K < 1 || blockSize < 1 || blockSize > 4096 || fileLen > 256 * 1024 * 1024) return null;
+  return { ver, type, flags, taskId, K, blockSize, fileLen, sha256, name };
 }
 
 // ---------- Data 帧 ----------
-export const DATA_HDR_LEN = 4 + 1 + 1 + 2 + 4; // magic+ver+flags+taskId+frameSeq
+export const DATA_HDR_LEN = 4 + 1 + 1 + 1 + 2 + 4; // magic+ver+type+flags+taskId+frameSeq
 export const DATA_CRC_LEN = 4;
+
+// 快速读取帧类型（magic4 + ver1 后的第 1 字节）；非法/过短返回 0。
+// 接收端用它在不解 CRC 的前提下分流 META / DATA。
+export function peekFrameType(buf) {
+  if (!buf || buf.length < 6 || !isMagic(buf)) return 0;
+  return buf[5];
+}
 
 export function buildDataFrame(d) {
   // d: {flags, taskId, frameSeq, payload(Uint8Array)}
@@ -116,6 +140,7 @@ export function buildDataFrame(d) {
   const w = new Writer(DATA_HDR_LEN + payload.length + DATA_CRC_LEN);
   w.bytes(MAGIC);
   w.u8(PROTO_VER);
+  w.u8(FRAME_TYPE_DATA);
   w.u8(d.flags & 0xff);
   w.u16(d.taskId & 0xffff);
   w.u32(d.frameSeq >>> 0);
@@ -124,21 +149,23 @@ export function buildDataFrame(d) {
   return w.out;
 }
 
-// 返回 {ver,flags,taskId,frameSeq,payload,crcOk} 或 null（非有效帧/CRC失败）
+// 返回 {ver,type,flags,taskId,frameSeq,payload,crcOk} 或 null（非有效帧/CRC失败）
 export function parseDataFrame(buf) {
   if (!isMagic(buf)) return null;
   if (buf.length < DATA_HDR_LEN + DATA_CRC_LEN) return null;
   const r = new Reader(buf);
   r.bytes(4);
   const ver = r.u8();
+  const type = r.u8();
+  if (type !== FRAME_TYPE_DATA) return null; // 严格拒绝 META 帧误当 DATA
   const flags = r.u8();
   const taskId = r.u16();
   const frameSeq = r.u32();
   const payload = r.bytes(buf.length - DATA_HDR_LEN - DATA_CRC_LEN);
   const crcGiven = r.u32();
   const crcOk = crcGiven === crc32(payload);
-  if (!crcOk) return { ver, flags, taskId, frameSeq, payload, crcOk: false };
-  return { ver, flags, taskId, frameSeq, payload, crcOk: true };
+  if (!crcOk) return { ver, type, flags, taskId, frameSeq, payload, crcOk: false };
+  return { ver, type, flags, taskId, frameSeq, payload, crcOk: true };
 }
 
 // ---------- 分片（M1：定长，最后一块不补齐；接收端按 frameSeq 重组） ----------
@@ -189,12 +216,35 @@ const RAW_CAPACITY = {
 };
 const EC_INDEX = { L: 0, M: 1, Q: 2, H: 3 };
 
+// 某版本/纠错级的 QR Byte 模式原始字节容量
+export function rawQrCapacity(version, ecLevel = "L") {
+  const row = RAW_CAPACITY[version];
+  if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
+  return row[EC_INDEX[ecLevel]];
+}
+
 // QR 内可承载的【数据帧 payload】安全上限 = 字节容量 - 帧头 - CRC。
+// 注意：这是"二进制帧字节"口径，未经 wire(base64)。发送端选 blockSize 必须
+// 用 wirePayloadCapacity（把 base64 膨胀算进去），否则编码后超 QR 容量，
+// qrcode-generator 静默容错产坏码 → 接收端 CRC 失败（v0.1.0 真机丢包根因之一）。
 export function qrPayloadCapacity(version, ecLevel = "L") {
   const row = RAW_CAPACITY[version];
   if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
   const raw = row[EC_INDEX[ecLevel]];
   return Math.max(0, raw - DATA_HDR_LEN - DATA_CRC_LEN);
+}
+
+// wire 文本（ASQP2.<base64整帧>.E）用 QR Byte 模式承载，字符数=字节数。
+// 给定 QR 版本，反推"单帧净 payload"最多多少字节，确保最终 wire 文本不超容量。
+// 预留 2 字节安全余量。
+export function wirePayloadCapacity(version, ecLevel = "L") {
+  const row = RAW_CAPACITY[version];
+  if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
+  // wire 长度 = 前缀6 + base64(4*ceil(frameBytes/3)) + 后缀2
+  const b64Budget = row[EC_INDEX[ecLevel]] - 2 - 8; // 扣余量与前后缀
+  const maxFrameBytes = Math.floor(b64Budget / 4) * 3; // base64 长度按 4 向上取整
+  const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
+  return Math.max(0, maxFrameBytes - fixed);
 }
 
 // M1 选档：给定 payload 需求字节，返回 {version, ec, capacity, blockSize}，
