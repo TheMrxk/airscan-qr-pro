@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirScan-QR Pro · 接收</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#7c3aed; --ok:#22c55e; --mut:#94a3b8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:#e2e8f0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:18px; margin:8px 0 4px; }
+  .sub { color:var(--mut); font-size:12px; margin-bottom:14px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
+  video { width:100%; border-radius:12px; background:#000; display:none; }
+  canvas.hidden { display:none; }
+  button { font-size:14px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; padding:12px 16px; cursor:pointer; width:100%; }
+  button.primary { background:var(--accent); border-color:var(--accent); font-weight:700; }
+  .bar { background:#0f172a; border-radius:999px; height:14px; overflow:hidden; margin:8px 0; }
+  .bar > i { display:block; height:100%; background:linear-gradient(90deg,#7c3aed,#3b82f6); width:0%; transition:width .2s; }
+  .stat { font-size:13px; color:var(--mut); line-height:1.9; }
+  .stat b { color:#fbbf24; }
+  .okbox { display:none; background:rgba(34,197,94,.12); border:1px solid var(--ok); border-radius:12px; padding:14px; }
+  .okbox a { color:#4ade80; }
+  .pill { display:inline-block; background:#0f172a; border:1px solid #334155; border-radius:999px; padding:2px 10px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📥 AirScan-QR Pro · 接收端</h1>
+  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1（v0.1）</div>
+
+  <div class="card">
+    <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
+    <video id="video" playsinline muted></video>
+    <canvas class="hidden" id="canvas"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="stat">
+      状态：<b id="phase">等待信号…</b><br>
+      任务：<span id="task">—</span>
+    </div>
+    <div class="bar"><i id="prog"></i></div>
+    <div class="stat">
+      已收块 <b id="got">0</b>/<span id="total">?</span>　
+      CRC失败 <b id="bad">0</b>　
+      扫描 <b id="fps">0</b> 帧/秒
+    </div>
+  </div>
+
+  <div class="card okbox" id="done">
+    <div style="font-size:15px;font-weight:700;color:#4ade80">✅ 接收完成，校验通过</div>
+    <div class="stat" id="doneInfo" style="margin:8px 0"></div>
+    <a id="download" download="#" style="display:inline-block;background:var(--ok);color:#04220f;padding:10px 16px;border-radius:10px;text-decoration:none;font-weight:700">💾 保存文件</a>
+  </div>
+</div>
+
+<script src="../vendor/jsQR.min.js"></script>
+<script type="module">
+import { unpackMeta, unpackData, assembleFile } from "../js/packet.js";
+import { decodeWire } from "../js/wire-codec.js";
+
+const $ = (id) => document.getElementById(id);
+let stream = null, raf = null, meta = null;
+const blocks = new Map();   // frameSeq -> payload
+let badCrc = 0, scans = 0, lastFpsT = performance.now();
+
+$("startCam").addEventListener("click", async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    const v = $("video");
+    v.srcObject = stream; v.style.display = "block";
+    await v.play();
+    $("startCam").style.display = "none";
+    loop();
+  } catch (e) {
+    $("phase").textContent = "无法打开摄像头：" + e.message + "（需 HTTPS 或 localhost）";
+  }
+});
+
+function loop() {
+  const v = $("video"), cv = $("canvas"), ctx = cv.getContext("2d", { willReadFrequently: true });
+  const w = v.videoWidth, h = v.videoHeight;
+  if (w && h) {
+    cv.width = w; cv.height = h;
+    ctx.drawImage(v, 0, 0, w, h);
+    scans++;
+    const img = ctx.getImageData(0, 0, w, h);
+    const res = jsQR(img.data, w, h, { inversionAttempts: "dontInvert" });
+    if (res && res.data) handleText(res.data);
+    // fps
+    const now = performance.now();
+    if (now - lastFpsT > 1000) {
+      $("fps").textContent = scans;
+      scans = 0; lastFpsT = now;
+    }
+  }
+  raf = requestAnimationFrame(loop);
+}
+
+function handleText(text) {
+  // 同一条线里可能含一个帧；decodeWire 截取首个完整帧
+  const frame = decodeWire(text);
+  if (!frame) return;
+
+  // 尚未锁定任务：任何帧都先试 meta
+  if (!meta) {
+    const m = unpackMeta(frame);
+    if (m && m.ver >= 1) { lockMeta(m); return; }
+    $("phase").textContent = "发现二维码，等待 META 帧…";
+    return;
+  }
+  const d = unpackData(frame);
+  if (!d) { badCrc++; $("bad").textContent = badCrc; return; }
+  if (d.taskId !== meta.taskId) return;       // 别的任务，忽略
+  if (d.frameSeq < 0 || d.frameSeq >= meta.K) return;
+  if (!blocks.has(d.frameSeq)) {
+    blocks.set(d.frameSeq, d.payload);
+    refresh();
+    if (blocks.size === meta.K) finish();
+  }
+}
+
+function lockMeta(m) {
+  meta = m; blocks.clear();
+  $("phase").textContent = "已锁定任务，收集数据帧…";
+  $("task").textContent = `${m.name} · ${(m.fileLen/1024).toFixed(1)}KB · ${m.K} 块 · ${m.flags & 1 ? "gzip" : "raw"}`;
+  $("total").textContent = m.K;
+  refresh();
+}
+
+function refresh() {
+  if (!meta) return;
+  $("got").textContent = blocks.size;
+  $("prog").style.width = (blocks.size / meta.K * 100) + "%";
+}
+
+async function finish() {
+  $("phase").textContent = "全部收齐，校验中…";
+  try {
+    const ordered = Array.from({ length: meta.K }, (_, i) => blocks.get(i));
+    const raw = await assembleFile(meta, ordered);
+    const blob = new Blob([raw], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = $("download");
+    a.href = url; a.download = meta.name;
+    $("doneInfo").innerHTML = `文件 <b>${meta.name}</b> · ${(raw.length/1024).toFixed(2)} KB · SHA-256 校验通过`;
+    $("done").style.display = "block";
+    $("phase").textContent = "✅ 完成";
+    cancelAnimationFrame(raf);
+  } catch (e) {
+    $("phase").textContent = "重组失败：" + e.message + "（继续采集重试）";
+  }
+}
+</script>
+</body>
+</html>

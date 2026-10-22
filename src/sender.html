@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirScan-QR Pro · 发送</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#3b82f6; --ok:#22c55e; --mut:#94a3b8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:#e2e8f0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:18px; margin:8px 0 4px; }
+  .sub { color:var(--mut); font-size:12px; margin-bottom:14px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
+  label.row { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  input[type=file], select, input[type=range] { width:100%; }
+  select, button { font-size:14px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; padding:10px 12px; }
+  button.primary { background:var(--accent); border-color:var(--accent); font-weight:700; cursor:pointer; width:100%; }
+  button.ghost { background:transparent; cursor:pointer; }
+  .line { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .stat { font-size:13px; color:var(--mut); line-height:1.9; }
+  .stat b { color:#fbbf24; font-variant-numeric:tabular-nums; }
+  #stage { display:none; text-align:center; }
+  #player { background:#fff; border-radius:12px; max-width:100%; }
+  .meta-overlay { font-size:12px; color:var(--mut); margin-top:8px; font-variant-numeric:tabular-nums; }
+  .pill { display:inline-block; background:#0f172a; border:1px solid #334155; border-radius:999px; padding:2px 10px; font-size:12px; margin-right:6px; }
+  .err { color:#f87171; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📤 AirScan-QR Pro · 发送端</h1>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码（v0.1）</div>
+
+  <div class="card" id="setup">
+    <label class="row">① 选择文件（或粘贴文本）</label>
+    <input type="file" id="file">
+    <label class="row">或直接输入文本（与文件二选一）</label>
+    <textarea id="text" rows="3" style="width:100%;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:10px;padding:10px" placeholder="粘贴要传输的文字…"></textarea>
+
+    <label class="row">② 扫描密度（越低越好扫；先从 V15 试）</label>
+    <select id="density">
+      <option value="10">V10 · 约 200B/帧（最稳，慢）</option>
+      <option value="15" selected>V15 · 约 350B/帧（推荐起步）</option>
+      <option value="20">V20 · 约 600B/帧</option>
+      <option value="25">V25 · 约 900B/帧（要求屏幕清晰）</option>
+    </select>
+
+    <label class="row">③ 播放帧率（帧/秒，手机识别跟得上再调高）<span id="fpsv">8</span> fps</label>
+    <input type="range" id="fps" min="2" max="20" value="8">
+
+    <div class="err" id="err"></div>
+    <div style="height:10px"></div>
+    <button class="primary" id="start">🚀 开始播放二维码</button>
+  </div>
+
+  <div class="card" id="stage">
+    <canvas id="player" width="480" height="480"></canvas>
+    <div class="meta-overlay">
+      <span class="pill" id="mType">META</span>
+      <span id="mSeq">0/0</span> · <span id="mTask"></span>
+    </div>
+    <div class="stat" id="stats" style="text-align:left;margin-top:10px"></div>
+    <div style="height:10px"></div>
+    <button class="ghost" id="stop">■ 停止</button>
+  </div>
+</div>
+
+<!-- 本地化库（无外链） -->
+<script src="../vendor/qrcode.js"></script>
+<script type="module">
+import { packFile } from "../js/packet.js";
+import { encodeWire } from "../js/wire-codec.js";
+import { qrPayloadCapacity } from "../js/protocol.js";
+
+const $ = (id) => document.getElementById(id);
+let timer = null, packed = null, playlist = [], cursor = 0;
+
+$("fps").addEventListener("input", e => $("fpsv").textContent = e.target.value);
+
+function err(msg){ $("err").textContent = msg || ""; }
+
+$("start").addEventListener("click", async () => {
+  err("");
+  const f = $("file").files[0];
+  const txt = $("text").value;
+  let data, name;
+  if (f) {
+    data = new Uint8Array(await f.arrayBuffer());
+    name = f.name;
+  } else if (txt) {
+    data = new TextEncoder().encode(txt);
+    name = "note_" + Date.now().toString().slice(-5) + ".txt";
+  } else { return err("请选择文件或输入文本"); }
+
+  const version = parseInt($("density").value, 10);
+  // 单帧原始帧字节上限 = QR byte容量；wire(base64)后文本要能放进同版本 QR，
+  // 这里把块大小按 base64 膨胀(4/3)反推，确保最终编码不超容量。
+  const byteCap = qrPayloadCapacity(version, "L");
+  const blockSize = Math.floor((byteCap - 20) * 3 / 4); // 留帧头余量，再反base64膨胀
+  try {
+    packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff) });
+  } catch (e) { return err("打包失败：" + e.message); }
+
+  // 播放序列：META 周期性插播 + 数据帧循环（M1 顺序轮播，靠重扫容错）
+  const metaWire = encodeWire(packed.metaFrame);
+  const dataWires = packed.dataFrames.map(fr => encodeWire(fr));
+  playlist = [{ text: metaWire, type: "META", seq: -1 },
+              ...dataWires.map((t, i) => ({ text: t, type: "DATA", seq: i }))];
+
+  $("setup").style.display = "none";
+  $("stage").style.display = "block";
+  $("mTask").textContent = `${name} · ${(data.length/1024).toFixed(1)}KB · K=${packed.meta.K} · V${version}`;
+  cursor = 0;
+  const fps = parseInt($("fps").value, 10);
+  drawFrame();
+  timer = setInterval(drawFrame, 1000 / fps);
+});
+
+function drawFrame() {
+  const item = playlist[cursor];
+  // qrcode-generator：自动选版本可能与密度选择不符；这里用指定 version 锁定
+  const version = parseInt($("density").value, 10);
+  const qr = qrcode(version, "L");
+  qr.addData(item.text, "Byte");
+  qr.make();
+  paint(qr);
+  $("mType").textContent = item.type;
+  $("mSeq").textContent = item.type === "DATA" ? `${item.seq + 1}/${packed.meta.K}` : "—";
+  cursor = (cursor + 1) % playlist.length;
+  if (item.type === "DATA") updateStats(item.seq);
+}
+
+function paint(qr) {
+  const cv = $("player"), ctx = cv.getContext("2d");
+  const n = qr.getModuleCount(), margin = 3, cell = Math.floor(cv.width / (n + margin * 2));
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (qr.isDark(r, c)) ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
+}
+
+let shown = new Set();
+function updateStats(seq) { shown.add(seq);
+  $("stats").innerHTML = `文件 <b>${packed.meta.name}</b>　总块 <b>${packed.meta.K}</b><br>本轮已显示 <b>${shown.size}</b> 个不同块　压缩 <b>${packed.meta.flags & 1 ? "gzip" : "raw"}</b><br>提示：序列循环播放，接收端集齐全部块即完成（M2 喷泉码后无需按序）`;
+}
+
+$("stop").addEventListener("click", () => {
+  clearInterval(timer); timer = null;
+  $("stage").style.display = "none";
+  $("setup").style.display = "block";
+  shown = new Set();
+});
+</script>
+</body>
+</html>
