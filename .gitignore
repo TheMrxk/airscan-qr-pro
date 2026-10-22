@@ -1,0 +1,22 @@
+# 依赖与构建
+node_modules/
+dist/
+build/
+
+# 本地自签证书（仅内网测试，不入库）
+cert.pem
+key.pem
+*.pem
+*.key
+
+# 临时/测速产物
+*.local.*
+/tmp/
+*.log
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
