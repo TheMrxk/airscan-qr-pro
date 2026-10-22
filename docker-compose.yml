@@ -1,20 +1,13 @@
 # AirScan-QR Pro —— 一条命令部署 PWA
 #
-# 两种使用场景：
-# 1) 公网域名（Cloudflare 反代）：容器映射主机 443，CF SSL 模式设 Full。
-#    用户访问 https://airscan.10v.cc/receiver.html（CF 边缘可信证书，无自签警告）。
-# 2) 局域网直连：用 8443，手机访问 https://<电脑IP>:8443/receiver.html（信任自签证书）。
+# 与其他项目一致：容器内纯 HTTP:80，主机映射到高端口；Cloudflare 在边缘提供 HTTPS。
+# CF 回源地址按端口配置（airscan.10v.cc → 主机IP:8443，回源协议 HTTP/Flexible）。
+# 用户访问 https://airscan.10v.cc/receiver.html（CF 可信证书，无自签警告）。
 services:
   airscan:
     build: .
     image: airscan-qr-pro:latest
     container_name: airscan-qr-pro
     ports:
-      - "443:8443"     # Cloudflare Full 回源（标准端口）
-      - "8443:8443"    # 局域网直连备用
-    volumes:
-      - airscan_certs:/certs
+      - "8443:80"
     restart: unless-stopped
-
-volumes:
-  airscan_certs:
