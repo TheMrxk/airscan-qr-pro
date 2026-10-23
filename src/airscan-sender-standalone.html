@@ -33,7 +33,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.4.3</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.4.4</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -3284,7 +3284,15 @@ function wireTextLen(frameByteLen) {
 
 const $ = (id) => document.getElementById(id);
 let timer = null, packed = null, seed = 1, frameCount = 0, matrixN = 1, qrVersion = 15;
-const META_EVERY = 24;   // 每播放 N 个数据【tick】整屏插播一次 META（帮晚到的接收端锁定）
+// META 插播策略：开头密集（帮接收端快速锁定），之后周期插播（帮中途加入者）。
+// 前 META_BOOST_TICKS 个 tick 每 3 帧插 1 帧 META；之后每 12 个 DATA tick 插 1 次。
+const META_BOOST_TICKS = 30;
+const META_EVERY_DENSE = 3;
+const META_EVERY_SPARSE = 12;
+function isMetaTick(fc) {
+  if (fc < META_BOOST_TICKS) return fc % META_EVERY_DENSE === 0;
+  return ((fc - META_BOOST_TICKS) % (META_EVERY_SPARSE + 1)) === 0;
+}
 
 $("fps").addEventListener("input", e => $("fpsv").textContent = e.target.value);
 
@@ -3380,7 +3388,7 @@ function drawFrame() {
   const cv = $("player"), ctx = cv.getContext("2d");
   const n2 = matrixN * matrixN;
   // 整屏要么全 META、要么全 DATA（接收端按格切分时类型一致）
-  const isMeta = frameCount % (META_EVERY + 1) === 0;
+  const isMeta = isMetaTick(frameCount);
 
   if (isMeta) {
     const qrs = new Array(n2).fill(encodeWire(packed.metaFrame)).map(makeQr);

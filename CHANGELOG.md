@@ -4,6 +4,26 @@
 版本号唯一来源是仓库根目录 `VERSION`，用 `python3 tools/sync_version.py` 同步到页面/manifest/SW，
 发版步骤见《开发文档.md》§11。标签打在可真机验收的提交上。
 
+## [v0.4.4] — 2026-10-23 · 修复长时间"等待 META 帧"锁不上任务
+
+真机反馈：多数时候停在"发现二维码，等待 META 帧"。排查确认 META 帧编解码本身正常
+（node 光学对拍各文件名/密度均可解），根因是**插播太稀疏**：META 每 25 tick 才出现 1 次、
+仅持续一帧，8fps 下约每 3 秒才有一次机会，手机那一瞬间没对准/没解出就要再等 3 秒。
+- **开头密集广播 META**：前 30 tick 每 3 帧插 1 帧 META（约 0.4s 一次，对准即锁）；
+  之后降为每 12 个 DATA tick 插 1 次（照顾中途加入者）。
+- META 帧短（模块少、空白多）比 DATA 帧好扫，密集期不影响整体吞吐太多。
+
+[Unreleased]: ../../compare/v0.4.4...HEAD
+[v0.4.4]: ../../releases/tag/v0.4.4
+[v0.4.3]: ../../releases/tag/v0.4.3
+[v0.4.2]: ../../releases/tag/v0.4.2
+[v0.4.1]: ../../releases/tag/v0.4.1
+[v0.4.0]: ../../releases/tag/v0.4.0
+[v0.3.0]: ../../releases/tag/v0.3.0
+[v0.2.0]: ../../releases/tag/v0.2.0
+[v0.1.1]: ../../releases/tag/v0.1.1
+[v0.1.0]: ../../releases/tag/v0.1.0
+
 ## [v0.4.3] — 2026-10-23 · 修复扫着崩溃、重进相机变长条扫不出（真机反馈）
 
 根因是 Worker 池与会话状态管理缺陷，系统修复：
@@ -15,16 +35,6 @@
   busy/raf/meta/pool，重开前等 loadedmetadata 出帧再解码，videoWidth=0/NaN/尺寸异常全部短路，
   drawImage/getImageData 全部 try/catch 兜底。
 - loop 的 busy 用 try/finally 保证任何异常都复位；重进相机先停旧流、清 srcObject 再申请新流。
-
-[Unreleased]: ../../compare/v0.4.3...HEAD
-[v0.4.3]: ../../releases/tag/v0.4.3
-[v0.4.2]: ../../releases/tag/v0.4.2
-[v0.4.1]: ../../releases/tag/v0.4.1
-[v0.4.0]: ../../releases/tag/v0.4.0
-[v0.3.0]: ../../releases/tag/v0.3.0
-[v0.2.0]: ../../releases/tag/v0.2.0
-[v0.1.1]: ../../releases/tag/v0.1.1
-[v0.1.0]: ../../releases/tag/v0.1.0
 
 ## [v0.4.2] — 2026-10-23 · 手机接收端布局修复（真机反馈）
 
