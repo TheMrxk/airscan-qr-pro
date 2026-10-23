@@ -49,7 +49,7 @@
 <body>
 <div class="wrap">
   <h1>📥 AirScan-QR Pro · 接收端</h1>
-  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.1.1</span></div>
+  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.2.0</span></div>
 
   <div class="card">
     <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
@@ -68,7 +68,7 @@
     </div>
     <div class="bar"><i id="prog"></i></div>
     <div class="stat">
-      已收块 <b id="got">0</b>/<span id="total">?</span>　
+      已解出源块 <b id="got">0</b>/<span id="total">?</span>　已收有效包 <b id="uniq">0</b>
       CRC失败 <b id="bad">0</b>　
       扫描 <b id="fps">0</b> 帧/秒
     </div>
@@ -91,15 +91,14 @@ if ("serviceWorker" in navigator) {
 }
 </script>
 <script type="module">
-import { unpackMeta, unpackData, assembleFile } from "../js/packet.js";
+import { unpackMeta, unpackData, LTReceiver } from "../js/packet.js";
 import { decodeWire } from "../js/wire-codec.js";
 import { peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA } from "../js/protocol.js";
 
 const $ = (id) => document.getElementById(id);
-let stream = null, raf = null, meta = null;
-const blocks = new Map();   // frameSeq -> payload
+let stream = null, raf = null, meta = null, recv = null;
 let badCrc = 0, scans = 0, lastFpsT = performance.now();
-let lockHit = false;        // 取景框绿框反馈节流
+let uniquePackets = 0;
 
 $("startCam").addEventListener("click", async () => {
   try {
@@ -175,13 +174,13 @@ function handleText(text) {
 
   const d = unpackData(frame);
   if (!d) { badCrc++; $("bad").textContent = badCrc; return; }
-  if (d.taskId !== meta.taskId) return;       // 别的任务，忽略
-  if (d.frameSeq < 0 || d.frameSeq >= meta.K) return;
-  if (!blocks.has(d.frameSeq)) {
-    blocks.set(d.frameSeq, d.payload);
-    refresh();
-    if (blocks.size === meta.K) finish();
-  }
+  if (d.taskId !== meta.taskId) return;        // 别的任务，忽略
+  if (recv.seenPacket(d.frameSeq)) return;     // 重复 LT 包（同 seed），忽略
+  recv.feed(d.frameSeq, d.payload, d.taskId);
+  uniquePackets++;
+  $("uniq").textContent = uniquePackets;
+  refresh();
+  if (recv.done) finish();
 }
 
 function fmtSize(bytes) {
@@ -191,36 +190,37 @@ function fmtSize(bytes) {
 }
 
 function lockMeta(m) {
-  meta = m; blocks.clear(); badCrc = 0;
-  $("phase").textContent = "已锁定任务，收集数据帧…";
+  meta = m; recv = new LTReceiver(m); uniquePackets = 0; badCrc = 0;
+  $("phase").textContent = "已锁定任务，LT 喷泉收集中…（漏扫无需重传）";
   const safeName = m.name || "(未命名)";
-  $("task").textContent = `${safeName} · ${fmtSize(m.fileLen)} · ${m.K} 块 · ${m.flags & 1 ? "gzip" : "raw"}`;
+  $("task").textContent = `${safeName} · ${fmtSize(m.fileLen)} · ${m.K} 源块 · ${m.flags & 1 ? "gzip" : "raw"}`;
   $("total").textContent = m.K;
-  $("camHint").textContent = "保持对准，绿色方框表示已识别";
+  $("camHint").textContent = "保持对准，绿色方框表示已识别，收够自动完成";
   refresh();
 }
 
 function refresh() {
-  if (!meta) return;
-  $("got").textContent = blocks.size;
-  $("prog").style.width = (blocks.size / meta.K * 100) + "%";
+  if (!meta || !recv) return;
+  $("got").textContent = recv.decodedBlocks;
+  $("prog").style.width = (recv.progress * 100) + "%";
 }
 
 async function finish() {
-  $("phase").textContent = "全部收齐，校验中…";
+  $("phase").textContent = "已收够，LT 解码 + 校验中…";
   try {
-    const ordered = Array.from({ length: meta.K }, (_, i) => blocks.get(i));
-    const raw = await assembleFile(meta, ordered);
+    const raw = await recv.assemble();
     const blob = new Blob([raw], { type: "application/octet-stream" });
     const url = URL.createObjectURL(blob);
     const a = $("download");
     a.href = url; a.download = meta.name;
-    $("doneInfo").innerHTML = `文件 <b>${meta.name}</b> · ${(raw.length/1024).toFixed(2)} KB · SHA-256 校验通过`;
+    $("doneInfo").innerHTML = `文件 <b>${meta.name}</b> · ${fmtSize(raw.length)} · 用 ${uniquePackets} 个 LT 包解出 ${meta.K} 块 · SHA-256 校验通过`;
     $("done").style.display = "block";
     $("phase").textContent = "✅ 完成";
+    $("camHint").textContent = "接收完成，可点保存文件";
     cancelAnimationFrame(raf);
   } catch (e) {
-    $("phase").textContent = "重组失败：" + e.message + "（继续采集重试）";
+    $("phase").textContent = "重组失败：" + e.message + "（继续采集即可，喷泉码会补齐）";
+    // 失败不复位解码器：继续收包后 BP 可能解出更多块
   }
 }
 </script>

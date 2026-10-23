@@ -18,7 +18,7 @@ SRC = ROOT / "src"
 OUT = ROOT / "release"
 
 # 业务模块依赖顺序（被依赖的在前）
-MODULES = ["protocol.js", "compressor.js", "packet.js", "wire-codec.js"]
+MODULES = ["protocol.js", "compressor.js", "lt-code.js", "packet.js", "wire-codec.js"]
 
 
 def read(p: Path) -> str:
@@ -39,8 +39,9 @@ def inline_modules() -> str:
         code = re.sub(r"^\s*export\s+(const|let|function|class|async)", r"\1", code,
                       flags=re.M)
         code = re.sub(r"^\s*export\s+default\s+", "", code, flags=re.M)
-        # export { a, b } 形式
-        code = re.sub(r"^\s*export\s*\{[^}]*\};?\s*$", "", code, flags=re.M)
+        # export { a, b } 形式；含重导出 export { x } from "..." 一并整行删除
+        code = re.sub(r"^\s*export\s*\{[^}]*\}(?:\s+from\s+[^;]+)?;?\s*$", "",
+                      code, flags=re.M)
         parts.append(f"/* ===== {name} ===== */\n{code}")
     return "\n".join(parts)
 

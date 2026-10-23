@@ -9,7 +9,7 @@ test("含0x00/高字节的数据帧：wire往返字节完全一致", () => {
   for (let i = 0; i < 900; i++) payload[i] = (i * 37 + 11) % 256; // 含0和255
   const frame = buildDataFrame({ flags: 1, taskId: 9, frameSeq: 777, payload });
   const text = encodeWire(frame);
-  assert.ok(text.startsWith("ASQP2."));
+  assert.ok(text.startsWith("ASQP3."));
   assert.ok(text.endsWith(".E"));
   assert.doesNotMatch(text, /[^\x20-\x7e]/, "wire 文本应全为可打印 ASCII");
   const back = decodeWire(text);
@@ -32,8 +32,9 @@ test("从带噪声/空白的扫码文本中提取帧", () => {
 
 test("非本协议文本返回 null", () => {
   assert.equal(decodeWire("https://example.com"), null);
-  assert.equal(decodeWire("ASQP2.@@@notbase64.E"), null);
+  assert.equal(decodeWire("ASQP3.@@@notbase64.E"), null);
   assert.equal(decodeWire("ASQP1.AAA=.E"), null); // v1 旧帧（无type字段）必须拒绝
+  assert.equal(decodeWire("ASQP2.AAA=.E"), null); // v2 旧帧（无compressedLen）必须拒绝
   assert.equal(decodeWire(""), null);
   assert.equal(decodeWire(null), null);
 });

@@ -14,7 +14,7 @@
 // frameSeq 同时承担去重/进度职责，协议头不变，保证收发兼容。
 
 export const MAGIC = new Uint8Array([0x41, 0x53, 0x51, 0x50]); // "ASQP"
-export const PROTO_VER = 2;
+export const PROTO_VER = 3;
 
 // 帧类型
 export const FRAME_TYPE_META = 1;
@@ -68,11 +68,11 @@ function isMagic(b) {
 }
 
 // ---------- Meta 帧 ----------
-export const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+sha256，不含 name
+export const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+compressedLen+sha256，不含 name
 export const META_MAX_NAME = 200;
 
 export function buildMetaFrame(meta) {
-  // meta: {taskId, flags, K, blockSize, fileLen, sha256(Uint8Array 32), name(str)}
+  // meta: {taskId, flags, K, blockSize, fileLen, compressedLen, sha256(Uint8Array 32), name(str)}
   const nameBytes = new TextEncoder().encode(meta.name || "");
   if (nameBytes.length > META_MAX_NAME) {
     throw new Error(`文件名过长(${nameBytes.length}>${META_MAX_NAME}B)，协议限制`);
@@ -89,6 +89,7 @@ export function buildMetaFrame(meta) {
   w.u16(meta.K & 0xffff);
   w.u16(meta.blockSize & 0xffff);
   w.u32(meta.fileLen >>> 0);
+  w.u32((meta.compressedLen ?? meta.fileLen) >>> 0); // v3：压缩后真实长度（raw 时=fileLen）
   w.bytes(meta.sha256);
   w.u8(nameBytes.length);
   w.bytes(nameBytes);
@@ -108,6 +109,7 @@ export function parseMetaFrame(buf) {
   const K = r.u16();
   const blockSize = r.u16();
   const fileLen = r.u32();
+  const compressedLen = r.u32();
   const sha256 = r.bytes(32);
   const nameLen = r.u8();
   if (r.left < nameLen) return null;
@@ -120,7 +122,8 @@ export function parseMetaFrame(buf) {
   }
   // 合理性校验：挡掉损坏/伪造帧解出的离谱元数据
   if (K < 1 || blockSize < 1 || blockSize > 4096 || fileLen > 256 * 1024 * 1024) return null;
-  return { ver, type, flags, taskId, K, blockSize, fileLen, sha256, name };
+  if (compressedLen < 0 || compressedLen > K * blockSize) return null;
+  return { ver, type, flags, taskId, K, blockSize, fileLen, compressedLen, sha256, name };
 }
 
 // ---------- Data 帧 ----------

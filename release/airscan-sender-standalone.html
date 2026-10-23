@@ -33,7 +33,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.1.1</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.2.0</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -2387,7 +2387,7 @@ var qrcode = function() {
 // M1 阶段 DataFrame.payload = 原始文件分片（无 LT）；M2 起改为 LT 编码包，
 // frameSeq 同时承担去重/进度职责，协议头不变，保证收发兼容。
 const MAGIC = new Uint8Array([0x41, 0x53, 0x51, 0x50]); // "ASQP"
-const PROTO_VER = 2;
+const PROTO_VER = 3;
 
 // 帧类型
 const FRAME_TYPE_META = 1;
@@ -2440,10 +2440,10 @@ function isMagic(b) {
 }
 
 // ---------- Meta 帧 ----------
-const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+sha256，不含 name
+const META_FIXED_LEN = 4 + 1 + 1 + 1 + 2 + 2 + 2 + 4 + 4 + 32; // magic+ver+type+flags+taskId+K+blockSize+fileLen+compressedLen+sha256，不含 name
 const META_MAX_NAME = 200;
 function buildMetaFrame(meta) {
-  // meta: {taskId, flags, K, blockSize, fileLen, sha256(Uint8Array 32), name(str)}
+  // meta: {taskId, flags, K, blockSize, fileLen, compressedLen, sha256(Uint8Array 32), name(str)}
   const nameBytes = new TextEncoder().encode(meta.name || "");
   if (nameBytes.length > META_MAX_NAME) {
     throw new Error(`文件名过长(${nameBytes.length}>${META_MAX_NAME}B)，协议限制`);
@@ -2460,6 +2460,7 @@ function buildMetaFrame(meta) {
   w.u16(meta.K & 0xffff);
   w.u16(meta.blockSize & 0xffff);
   w.u32(meta.fileLen >>> 0);
+  w.u32((meta.compressedLen ?? meta.fileLen) >>> 0); // v3：压缩后真实长度（raw 时=fileLen）
   w.bytes(meta.sha256);
   w.u8(nameBytes.length);
   w.bytes(nameBytes);
@@ -2478,6 +2479,7 @@ function parseMetaFrame(buf) {
   const K = r.u16();
   const blockSize = r.u16();
   const fileLen = r.u32();
+  const compressedLen = r.u32();
   const sha256 = r.bytes(32);
   const nameLen = r.u8();
   if (r.left < nameLen) return null;
@@ -2490,7 +2492,8 @@ function parseMetaFrame(buf) {
   }
   // 合理性校验：挡掉损坏/伪造帧解出的离谱元数据
   if (K < 1 || blockSize < 1 || blockSize > 4096 || fileLen > 256 * 1024 * 1024) return null;
-  return { ver, type, flags, taskId, K, blockSize, fileLen, sha256, name };
+  if (compressedLen < 0 || compressedLen > K * blockSize) return null;
+  return { ver, type, flags, taskId, K, blockSize, fileLen, compressedLen, sha256, name };
 }
 
 // ---------- Data 帧 ----------
@@ -2680,12 +2683,189 @@ async function decompress(data, flags) {
   return new Uint8Array(data);
 }
 
-/* ===== packet.js ===== */
-// packet.js — 文件 ↔ 帧序列 的高层打包/解包（M1）
-// 串起 compressor + protocol，对 sender/receiver/UI 暴露简单接口。
+/* ===== lt-code.js ===== */
+// lt-code.js — Luby Transform 喷泉码（M2/P1）
+// 纯 ES Module，无依赖，浏览器与 Node(node:test) 通用。
 //
-// M1：顺序定长分片（无 LT）。M2 接入喷泉码时只替换内部分片策略，
-// 帧头与 meta 不变。
+// 设计要点：
+// - 文件补齐切成 K 个等长 source block（最后一块零补齐，真实长度由 meta.fileLen 截断）。
+// - 每个编码包只带 seed（=帧 frameSeq）。发送端/接收端用同一确定性 PRNG 由 seed
+//   重现「度 + 邻居 block 列表」，所以无需在包里传邻居，省大量载荷。
+// - 鲁棒孤波分布（Robust Soliton）抽度；接收端置信传播（BP）解码。
+// - 收任意 K·(1+ε) 个不同包即可解出，无需 ACK、无需知道缺哪帧、天然抗丢帧/乱序/重复。
+//
+// 参数 c / delta 为可调项（§9 开放问题，真机数据后再标定），默认经典值 c=0.1, delta=0.001。
+
+// ---------- 确定性 PRNG（mulberry32）：同 seed 两端序列完全一致 ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- 鲁棒孤波度分布 ----------
+// 返回按给定 rng 抽一个度 d（1..K）的函数所需的 CDF。
+function buildRobustSoliton(K, c, delta) {
+  const S = c * Math.log(K / delta) * Math.sqrt(K); // 期望度峰值的辅助量
+  const pivot = Math.max(1, Math.round(K / S));     // 尖峰位置（K/S 附近）
+  const pdf = new Float64Array(K + 1);              // 1..K
+  for (let d = 1; d <= K; d++) {
+    // rho：理想孤波
+    let rho = d === 1 ? 1 / K : 1 / (d * (d - 1));
+    // tau：鲁棒修正
+    let tau = 0;
+    if (d < pivot) tau = S / (d * K);
+    else if (d === pivot) tau = (S / K) * Math.log(S / delta);
+    pdf[d] = rho + tau;
+  }
+  let sum = 0;
+  for (let d = 1; d <= K; d++) sum += pdf[d];
+  // 归一化为 CDF
+  const cdf = new Float64Array(K + 1);
+  let acc = 0;
+  for (let d = 1; d <= K; d++) { acc += pdf[d] / sum; cdf[d] = acc; }
+  cdf[K] = 1; // 消除浮点误差，保证能抽到 K
+  return cdf;
+}
+
+function sampleDegree(rng, cdf, K) {
+  const u = rng();
+  for (let d = 1; d <= K; d++) if (u < cdf[d]) return d;
+  return K;
+}
+
+// 无放回抽 degree 个不同邻居（Fisher–Yates 部分洗牌，确定性依赖 rng）
+function sampleNeighbors(rng, K, degree) {
+  const idx = Array.from({ length: K }, (_, i) => i);
+  for (let i = 0; i < degree; i++) {
+    const j = i + Math.floor(rng() * (K - i));
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  return idx.slice(0, degree);
+}
+
+// 由 seed 重现该编码包的 {degree, neighbors}。两端必须用完全相同的 K/c/delta。
+function describePacket(seed, K, c = 0.2, delta = 0.001) {
+  const rng = mulberry32(seed);
+  const cdf = buildRobustSoliton(K, c, delta);
+  const degree = sampleDegree(rng, cdf, K);
+  const neighbors = sampleNeighbors(rng, K, degree);
+  return { degree, neighbors };
+}
+
+// ---------- 编码：生成第 seed 个 LT 包的 XOR payload ----------
+function encodePacket(blocks, seed, c = 0.2, delta = 0.001) {
+  const K = blocks.length;
+  const blockSize = blocks[0].length;
+  const { neighbors } = describePacket(seed, K, c, delta);
+  const out = new Uint8Array(blockSize);
+  for (const n of neighbors) {
+    const b = blocks[n];
+    for (let i = 0; i < blockSize; i++) out[i] ^= b[i];
+  }
+  return out;
+}
+
+// ---------- 解码：置信传播（BP） ----------
+// 用法：const dec = new LTDecoder(K, blockSize);
+//       每收到一个包 dec.addPacket(seed, payload)；dec.blocks 解出后非 null。
+class LTDecoder {
+  constructor(K, blockSize, c = 0.2, delta = 0.001) {
+    this.K = K;
+    this.blockSize = blockSize;
+    this.c = c; this.delta = delta;
+    this.blocks = new Array(K).fill(null);   // 解出的源块
+    this.decodedCount = 0;
+    this.seen = new Set();                    // 已处理 seed（去重）
+    // 未决（尚未消成单邻居）的包：neighbors 为「仍未知」的源块索引，payload 为剩余 XOR
+    this.pending = [];
+  }
+
+  get done() { return this.decodedCount === this.K; }
+  get progress() { return this.decodedCount / this.K; }
+
+  addPacket(seed, payloadIn) {
+    seed = seed >>> 0;
+    if (this.done || this.seen.has(seed)) return;
+    if (!payloadIn || payloadIn.length !== this.blockSize) return; // 长度不符，丢弃
+    this.seen.add(seed);
+
+    // 拷贝一份，避免修改接收缓冲；先 XOR 掉所有「已知」源块
+    const payload = new Uint8Array(this.blockSize);
+    payload.set(payloadIn);
+    const { neighbors } = describePacket(seed, this.K, this.c, this.delta);
+    const unknown = [];
+    for (const n of neighbors) {
+      if (this.blocks[n]) {
+        const b = this.blocks[n];
+        for (let i = 0; i < this.blockSize; i++) payload[i] ^= b[i];
+      } else unknown.push(n);
+    }
+    if (unknown.length === 0) return; // 纯冗余包
+    if (unknown.length === 1) {
+      this._recover(unknown[0], payload);
+    } else {
+      this.pending.push({ unknown, payload });
+    }
+  }
+
+  // 解出一个源块，并在所有未决包中传播（消元）
+  _recover(index, value) {
+    if (this.blocks[index]) return;
+    this.blocks[index] = value;
+    this.decodedCount++;
+    // 遍历未决列表，原地消元；产生新的度1包则递归
+    const newly = [];
+    const keep = [];
+    for (const p of this.pending) {
+      const pos = p.unknown.indexOf(index);
+      if (pos >= 0) {
+        for (let i = 0; i < this.blockSize; i++) p.payload[i] ^= value[i];
+        p.unknown.splice(pos, 1);
+        if (p.unknown.length === 1) newly.push(p);
+        else if (p.unknown.length > 1) keep.push(p);
+        // unknown.length===0：纯冗余，丢弃
+      } else {
+        keep.push(p);
+      }
+    }
+    this.pending = keep;
+    for (const p of newly) {
+      if (this.done) break;
+      this._recover(p.unknown[0], p.payload);
+    }
+  }
+}
+
+// 把字节数据切成 K 个等长块（最后一块零补齐），返回 {blocks, K, blockSize, rawLen}
+function splitEqual(data, blockSize) {
+  const raw = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const K = Math.max(1, Math.ceil(raw.length / blockSize));
+  const blocks = new Array(K);
+  for (let i = 0; i < K; i++) {
+    const blk = new Uint8Array(blockSize);
+    const start = i * blockSize;
+    blk.set(raw.subarray(start, Math.min(start + blockSize, raw.length)));
+    blocks[i] = blk;
+  }
+  return { blocks, K, blockSize, rawLen: raw.length };
+}
+
+/* ===== packet.js ===== */
+// packet.js — 文件 ↔ 喷泉码帧序列 的高层打包/解包（M2：LT）
+// 串起 compressor + protocol + lt-code，对 sender/receiver/UI 暴露简单接口。
+//
+// M2 架构：
+//   发送：文件→(压缩)→补齐切 K 个等长 source block→每个播放时刻按 seed 现算 LT 编码包→帧
+//        seed 单调递增（就是帧的 frameSeq），无限产生，屏幕循环播放；META 周期插播。
+//   接收：META 锁定→建 LTReceiver→每收到一个不同 seed 的包就喂入→BP 解码→
+//        收任意 ~1.4K 个有效包即解出→截断到 compressedLen→解压→SHA256 校验。
+// 无需 ACK、无需知道缺哪帧，天然抗丢帧/乱序/重复。
+
 
 
 
@@ -2699,86 +2879,89 @@ async function sha256(bytes) {
   return new Uint8Array(createHash("sha256").update(bytes).digest());
 }
 
-// 把文件打包成 {metaFrame, dataFrames, meta}。
-// 入参：{name, data(Uint8Array), taskId?, blockSize?, forceRaw?}
-// 不显式给 blockSize 时，按目标 QR 档位（默认让单码尽量大但留摄像头余量）选。
+// 把文件打包成 LT 发送上下文。
+// 入参：{name, data(Uint8Array), taskId?, blockSize, forceRaw?}
+// 返回：{meta, metaFrame, blocks(等长补齐), K, blockSize}
+// 不预生成所有帧——LT 包用 makeLtFrame(seed) 现算（无限流）。
 async function packFile({
   name, data, taskId = null,
-  blockSize = null, ecLevel = "L",
-  forceRaw = false,
+  blockSize, forceRaw = false,
 }) {
+  if (!blockSize || blockSize < 1) throw new Error("LT 必须显式给 blockSize（按 QR 密度反推）");
   const raw = data instanceof Uint8Array ? data : new Uint8Array(data);
   const { flags, data: payloadData } = await compress(raw, { forceRaw });
 
-  // M1 选保守档位：默认 V25-L 单码 payload（摄像头好扫），不直接顶 V40。
-  // 块大小不超该档位 payload 上限。
-  let bs = blockSize;
-  if (!bs) {
-    const prof = chooseQrProfileForScan(25, ecLevel);
-    bs = prof.blockSize;
-  }
-  const K = Math.max(1, Math.ceil(payloadData.length / bs));
+  const { blocks, K } = splitEqual(payloadData, blockSize);
   const tId = taskId == null ? Math.floor(Math.random() * 0xffff) : taskId & 0xffff;
   const digest = await sha256(raw);
 
   const meta = {
-    taskId: tId, flags, K, blockSize: bs,
-    fileLen: raw.length, sha256: digest, name: name || "file.bin",
+    taskId: tId, flags, K, blockSize,
+    fileLen: raw.length, compressedLen: payloadData.length, sha256: digest,
+    name: name || "file.bin",
   };
   const metaFrame = buildMetaFrame(meta);
-  const dataFrames = buildDataFrames(meta, payloadData);
-  return { meta, metaFrame, dataFrames };
+  return { meta, metaFrame, blocks, K, blockSize };
 }
 
-// 接收端：喂 metaFrame（可重复，锁定首个任务）→ 返回 meta。
+// 现算第 seed 个 LT 编码包的数据帧（发送端每个播放时刻调用）
+function makeLtFrame(packed, seed) {
+  const payload = encodePacket(packed.blocks, seed);
+  return buildDataFrame({
+    flags: packed.meta.flags, taskId: packed.meta.taskId, frameSeq: seed, payload,
+  });
+}
+
+// 接收端：喂 metaFrame → 返回 meta（null=还不是有效 meta）
 function unpackMeta(frame) {
-  const m = parseMetaFrame(frame);
-  return m; // null = 还不是有效 meta
+  return parseMetaFrame(frame);
 }
 
-// 接收端：解一个数据帧 → {frameSeq,payload,crcOk}
+// 解一个数据帧 → {frameSeq(=seed),payload,crcOk}；CRC 坏/类型错返回 null
 function unpackData(frame) {
   const d = parseDataFrame(frame);
   if (!d || !d.crcOk) return null;
   return { taskId: d.taskId, frameSeq: d.frameSeq, payload: d.payload, ver: d.ver };
 }
 
-// 用收齐的 K 个有序块重组并校验，返回原始文件 Uint8Array。
-// blocks: 按 frameSeq 排好的 payload 数组（M1 等齐 K 个）。
-async function assembleFile(meta, blocks) {
-  if (blocks.length !== meta.K) {
-    throw new Error(`块数不足：${blocks.length}/${meta.K}`);
+// 接收端 LT 收集器：锁定 meta 后建一个，逐包喂入，done 后取文件。
+class LTReceiver {
+  constructor(meta) {
+    this.meta = meta;
+    this.dec = new LTDecoder(meta.K, meta.blockSize);
   }
-  const total = meta.blockSize * (meta.K - 1) +
-    blocks[meta.K - 1].length;
-  // 用各块实际长度拼，最后一块不补齐；总长按压缩数据 = Σ块长
-  const compressed = concat(blocks);
-  const raw = await decompress(compressed, meta.flags);
-  if (raw.length !== meta.fileLen) {
-    throw new Error(`解压后长度不符：${raw.length}/${meta.fileLen}`);
+  get progress() { return this.dec.progress; }
+  get decodedBlocks() { return this.dec.decodedCount; }
+  get done() { return this.dec.done; }
+  seenPacket(seed) { return this.dec.seen.has(seed); }
+  // 喂入一个 CRC 正确、taskId 匹配的数据包
+  feed(seed, payload, taskId) {
+    if (taskId !== this.meta.taskId) return;
+    this.dec.addPacket(seed, payload);
   }
-  const digest = await sha256(raw);
-  if (!bytesEqual(digest, meta.sha256)) {
-    throw new Error("SHA-256 校验失败，文件损坏");
+  // 解出全部块 → 截断到 compressedLen → 解压 → 长度+SHA256 校验 → 原始文件
+  async assemble() {
+    if (!this.dec.done) throw new Error(`LT 未解完：${this.dec.decodedCount}/${this.meta.K}`);
+    const { K, blockSize, compressedLen } = this.meta;
+    const compressed = new Uint8Array(compressedLen);
+    for (let i = 0; i < K; i++) {
+      const blk = this.dec.blocks[i];
+      compressed.set(blk.subarray(0, Math.min(blockSize, compressedLen - i * blockSize)), i * blockSize);
+    }
+    const raw = await decompress(compressed, this.meta.flags);
+    if (raw.length !== this.meta.fileLen) {
+      throw new Error(`解压后长度不符：${raw.length}/${this.meta.fileLen}`);
+    }
+    const digest = await sha256(raw);
+    if (!bytesEqual(digest, this.meta.sha256)) throw new Error("SHA-256 校验失败，文件损坏");
+    return raw;
   }
-  return raw;
 }
-function concat(arrs) {
-  const n = arrs.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(n);
-  let o = 0;
-  for (const a of arrs) { out.set(a, o); o += a.length; }
-  return out;
-}
+
 function bytesEqual(a, b) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
-}
-
-// M1 扫描档位（保守，优先识别率）。version 越大容量越大但越难扫。
-function chooseQrProfileForScan(version = 25, ecLevel = "L") {
-  return { version, ec: ecLevel, blockSize: qrPayloadCapacity(version, ecLevel) };
 }
 
 /* ===== wire-codec.js ===== */
@@ -2789,12 +2972,12 @@ function chooseQrProfileForScan(version = 25, ecLevel = "L") {
 // 故网页链路在 QR 边界统一做 Base64；P4 客户端(zbar 原始字节)可跳过本层（enc=raw）。
 //
 // 为让接收端能从一帧扫码文本里稳定切出 payload，每条扫码行用前缀/帧界定：
-//   "ASQP2." + base64(payload) + ".E"
-// 前缀含协议魔数与协议大版本（PROTO_VER=2）；base64 字符集不含 '.'，故 '.' 可作安全定界。
-// v1 前缀 ASQP1. 为 v0.1.0 旧帧（无 type 字段，有 meta/data 误锁 bug），直接不识别。
+//   "ASQP3." + base64(payload) + ".E"
+// 前缀含协议魔数与协议大版本（PROTO_VER=3，M2 LT 喷泉码）；base64 字符集不含 '.'，故 '.' 可作安全定界。
+// v2(ASQP2.) 为 M1 定长分片，v1(ASQP1.) 为无 type 字段的缺陷版，均不再识别。
 
 
-const PREFIX = "ASQP2."; // MAGIC ASCII("ASQP") + 协议版本2 + '.'
+const PREFIX = "ASQP3."; // MAGIC ASCII("ASQP") + 协议版本3 + '.'
 const SUFFIX = ".E";
 
 function bytesToB64(u8) {
@@ -2850,7 +3033,8 @@ function wireTextLen(frameByteLen) {
 
 
 const $ = (id) => document.getElementById(id);
-let timer = null, packed = null, playlist = [], cursor = 0;
+let timer = null, packed = null, seed = 1, frameCount = 0;
+const META_EVERY = 24;   // 每播放 N 个数据帧插播一次 META（帮晚到的接收端锁定任务）
 
 $("fps").addEventListener("input", e => $("fpsv").textContent = e.target.value);
 
@@ -2870,50 +3054,49 @@ $("start").addEventListener("click", async () => {
   } else { return err("请选择文件或输入文本"); }
 
   const version = parseInt($("density").value, 10);
-  // 用精确容量反推 blockSize：wire 文本 = ASQP2. + base64(整帧) + .E，
-  // 必须整段放进所选版本 QR，qrcode-generator 超长不报错只会产坏码。
+  // LT 等长块：用精确容量反推 blockSize（wire base64 膨胀已计入）
   const blockSize = wirePayloadCapacity(version, "L");
   if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
     packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff) });
   } catch (e) { return err("打包失败：" + e.message); }
 
-  // 播放序列：META 周期性插播 + 数据帧循环（M1 顺序轮播，靠重扫容错）
-  const metaWire = encodeWire(packed.metaFrame);
-  const dataWires = packed.dataFrames.map(fr => encodeWire(fr));
-
-  // 越界硬校验：任一帧 wire 文本超过该 QR 容量直接报错，绝不播放坏码
-  const cap = rawQrCapacity(version, "L");
-  const over = [metaWire, ...dataWires].filter(t => t.length > cap);
-  if (over.length) {
-    return err(`编码越界：${over.length} 帧超过 V${version}-L 容量 ${cap}（最长 ${Math.max(...over.map(t=>t.length))}），请降密度`);
-  }
-
-  playlist = [{ text: metaWire, type: "META", seq: -1 },
-              ...dataWires.map((t, i) => ({ text: t, type: "DATA", seq: i }))];
-
   $("setup").style.display = "none";
   $("stage").style.display = "block";
-  $("mTask").textContent = `${name} · ${(data.length/1024).toFixed(1)}KB · K=${packed.meta.K} · V${version}`;
-  cursor = 0;
+  $("mTask").textContent = `${name} · ${(data.length/1024).toFixed(1)}KB · K=${packed.meta.K} · V${version} · LT喷泉`;
+  seed = 1; frameCount = 0; sentPackets = 0;
   const fps = parseInt($("fps").value, 10);
   drawFrame();
   timer = setInterval(drawFrame, 1000 / fps);
 });
 
 function drawFrame() {
-  const item = playlist[cursor];
-  // qrcode-generator：自动选版本可能与密度选择不符；这里用指定 version 锁定
+  // META 周期插播；其余为 LT 数据帧，seed 单调递增（无限喷泉流）
+  const isMeta = frameCount % (META_EVERY + 1) === 0;
+  let text, type, seq;
+  if (isMeta) {
+    text = encodeWire(packed.metaFrame); type = "META"; seq = -1;
+  } else {
+    text = encodeWire(makeLtFrame(packed, seed)); type = "DATA"; seq = seed; seed++;
+  }
+  frameCount++;
+
+  // 越界硬校验（理论上 wirePayloadCapacity 已保证，双保险不放坏码）
   const version = parseInt($("density").value, 10);
+  if (text.length > rawQrCapacity(version, "L")) {
+    err(`编码越界：${text.length} > V${version} 容量，请降密度`); stop_(); return;
+  }
+
   const qr = qrcode(version, "L");
-  qr.addData(item.text, "Byte");
+  qr.addData(text, "Byte");
   qr.make();
   paint(qr);
-  $("mType").textContent = item.type;
-  $("mSeq").textContent = item.type === "DATA" ? `${item.seq + 1}/${packed.meta.K}` : "—";
-  cursor = (cursor + 1) % playlist.length;
-  if (item.type === "DATA") updateStats(item.seq);
+  $("mType").textContent = type;
+  $("mSeq").textContent = type === "DATA" ? `LT#${seq}` : "—";
+  if (type === "DATA") updateStats(seq);
 }
+
+function stop_(){ clearInterval(timer); timer = null; }
 
 function paint(qr) {
   const cv = $("player"), ctx = cv.getContext("2d");
@@ -2924,16 +3107,17 @@ function paint(qr) {
     if (qr.isDark(r, c)) ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
 }
 
-let shown = new Set();
-function updateStats(seq) { shown.add(seq);
-  $("stats").innerHTML = `文件 <b>${packed.meta.name}</b>　总块 <b>${packed.meta.K}</b><br>本轮已显示 <b>${shown.size}</b> 个不同块　压缩 <b>${packed.meta.flags & 1 ? "gzip" : "raw"}</b><br>提示：序列循环播放，接收端集齐全部块即完成（M2 喷泉码后无需按序）`;
+let sentPackets = 0;
+function updateStats() {
+  sentPackets++;
+  $("stats").innerHTML = `文件 <b>${packed.meta.name}</b>　源块 K=<b>${packed.meta.K}</b><br>已播放 LT 包 <b>${sentPackets}</b>（接收端收够约 ${Math.ceil(packed.meta.K*1.5)}~${Math.ceil(packed.meta.K*2)} 个即自动完成）<br>压缩 <b>${packed.meta.flags & 1 ? "gzip" : "raw"}</b> · 漏扫无需重传`;
 }
 
 $("stop").addEventListener("click", () => {
   clearInterval(timer); timer = null;
   $("stage").style.display = "none";
   $("setup").style.display = "block";
-  shown = new Set();
+  sentPackets = 0;
 });
 
 </script>

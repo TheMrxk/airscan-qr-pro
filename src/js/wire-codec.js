@@ -5,13 +5,13 @@
 // 故网页链路在 QR 边界统一做 Base64；P4 客户端(zbar 原始字节)可跳过本层（enc=raw）。
 //
 // 为让接收端能从一帧扫码文本里稳定切出 payload，每条扫码行用前缀/帧界定：
-//   "ASQP2." + base64(payload) + ".E"
-// 前缀含协议魔数与协议大版本（PROTO_VER=2）；base64 字符集不含 '.'，故 '.' 可作安全定界。
-// v1 前缀 ASQP1. 为 v0.1.0 旧帧（无 type 字段，有 meta/data 误锁 bug），直接不识别。
+//   "ASQP3." + base64(payload) + ".E"
+// 前缀含协议魔数与协议大版本（PROTO_VER=3，M2 LT 喷泉码）；base64 字符集不含 '.'，故 '.' 可作安全定界。
+// v2(ASQP2.) 为 M1 定长分片，v1(ASQP1.) 为无 type 字段的缺陷版，均不再识别。
 
 import { MAGIC } from "./protocol.js";
 
-const PREFIX = "ASQP2."; // MAGIC ASCII("ASQP") + 协议版本2 + '.'
+const PREFIX = "ASQP3."; // MAGIC ASCII("ASQP") + 协议版本3 + '.'
 const SUFFIX = ".E";
 
 function bytesToB64(u8) {
