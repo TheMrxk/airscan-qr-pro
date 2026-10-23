@@ -4,6 +4,28 @@
 版本号唯一来源是仓库根目录 `VERSION`，用 `python3 tools/sync_version.py` 同步到页面/manifest/SW，
 发版步骤见《开发文档.md》§11。标签打在可真机验收的提交上。
 
+## [v0.4.3] — 2026-10-23 · 修复扫着崩溃、重进相机变长条扫不出（真机反馈）
+
+根因是 Worker 池与会话状态管理缺陷，系统修复：
+- **Worker 池泄漏导致扫着崩**：旧实现按矩阵阶数建 1~9 个 worker、切换时不销毁、超时不移除监听、
+  transfer buffer 所有权风险，反复进出累积占满资源。改为**固定 2 个 worker 复用**、
+  每次请求自增 id 且 settle 后必移除监听、超时 800ms 只丢当格、新增 destroy() 彻底 terminate、
+  不再 transfer（复制更安全）。
+- **重进扫不出 / 相机长条**：busy 标志在异常路径未复位会永久跳过解码；start/stop 现在彻底复位
+  busy/raf/meta/pool，重开前等 loadedmetadata 出帧再解码，videoWidth=0/NaN/尺寸异常全部短路，
+  drawImage/getImageData 全部 try/catch 兜底。
+- loop 的 busy 用 try/finally 保证任何异常都复位；重进相机先停旧流、清 srcObject 再申请新流。
+
+[Unreleased]: ../../compare/v0.4.3...HEAD
+[v0.4.3]: ../../releases/tag/v0.4.3
+[v0.4.2]: ../../releases/tag/v0.4.2
+[v0.4.1]: ../../releases/tag/v0.4.1
+[v0.4.0]: ../../releases/tag/v0.4.0
+[v0.3.0]: ../../releases/tag/v0.3.0
+[v0.2.0]: ../../releases/tag/v0.2.0
+[v0.1.1]: ../../releases/tag/v0.1.1
+[v0.1.0]: ../../releases/tag/v0.1.0
+
 ## [v0.4.2] — 2026-10-23 · 手机接收端布局修复（真机反馈）
 
 真机反馈三个问题，全部修复：
@@ -13,15 +35,6 @@
 - **没有返回按钮**：顶栏加「← 返回」，点击关闭摄像头、停解码/计时、复位到初始态。
 - **没有扫描用时**：状态行加实时用时（开摄像头起累计，x s / xm xxs），完成信息也带总用时。
 - 完成后自动滚动到保存区；标题栏收紧为一行。
-
-[Unreleased]: ../../compare/v0.4.2...HEAD
-[v0.4.2]: ../../releases/tag/v0.4.2
-[v0.4.1]: ../../releases/tag/v0.4.1
-[v0.4.0]: ../../releases/tag/v0.4.0
-[v0.3.0]: ../../releases/tag/v0.3.0
-[v0.2.0]: ../../releases/tag/v0.2.0
-[v0.1.1]: ../../releases/tag/v0.1.1
-[v0.1.0]: ../../releases/tag/v0.1.0
 
 ## [v0.4.1] — 2026-10-23 · 真机反馈：矩阵每格太小难识别，canvas 自适应放大
 

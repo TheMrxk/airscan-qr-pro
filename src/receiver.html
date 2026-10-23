@@ -63,7 +63,7 @@
   <div class="topbar">
     <div>
       <h1>📥 AirScan-QR Pro · 接收端</h1>
-      <div class="sub" style="margin-bottom:0">对准发送屏幕 · 自动收集 · SHA-256 · <span data-app-version>v0.4.2</span></div>
+      <div class="sub" style="margin-bottom:0">对准发送屏幕 · 自动收集 · SHA-256 · <span data-app-version>v0.4.3</span></div>
     </div>
     <button class="back-btn ghost" id="backBtn" style="display:none">← 返回</button>
   </div>
@@ -132,28 +132,46 @@ let lockT = 0, lastDecoded = 0, lastRateT = 0; // 速率/ETA 统计
 let elapsedTimer = null;
 
 $("startCam").addEventListener("click", async () => {
+  // 重进前彻底复位，避免上次崩溃/返回残留的状态（busy 卡死、旧 worker、旧 raf）
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  busy = false;
+  meta = null; recv = null; matrixN = 1; uniquePackets = 0; badCrc = 0;
+  if (pool) { pool.destroy(); pool = null; }
+  const vv = $("video");
+  vv.srcObject = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false,
     });
-    const v = $("video");
-    v.srcObject = stream;
-    await v.play();
+    vv.srcObject = stream;
+    await vv.play();
+    // 等视频真正出帧再开始解码，避免 videoWidth=0 时的异常裁剪
+    if (!vv.videoWidth) {
+      await new Promise((res) => {
+        vv.addEventListener("loadedmetadata", res, { once: true });
+        setTimeout(res, 1000);
+      });
+    }
     $("startCam").style.display = "none";
     $("view").style.display = "block";
     $("backBtn").style.display = "inline-block";
+    $("reticle").setAttribute("data-n", "1");
     startElapsed();
-    loop();
+    raf = requestAnimationFrame(loop);
   } catch (e) {
     $("phase").textContent = "无法打开摄像头：" + e.message + "（需 HTTPS 或 localhost）";
   }
 });
 
-// 返回：关摄像头、停解码与计时、复位界面到初始
+// 返回/重置：关摄像头、销毁 worker、停解码与计时（busy 复位，保证能重进）
 function stopAll() {
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  const vv = $("video");
+  if (vv) { vv.srcObject = null; }
   if (raf) { cancelAnimationFrame(raf); raf = null; }
+  if (pool) { pool.destroy(); pool = null; }
+  busy = false;
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
 }
 $("backBtn").addEventListener("click", () => {
@@ -191,35 +209,56 @@ function decodeSync(imageData, w, h) {
   } catch { return null; }
 }
 
-// Worker 解码池：矩阵时多格并行，避免 jsQR 单线程阻塞 UI；失败回退主线程。
+// Worker 解码池：固定 2 个 worker 串行消化多格任务，避免低配手机多 worker 抢资源崩溃。
+// 每个请求有自增 id，超时只丢弃本次结果，绝不残留监听；destroy 彻底 terminate。
 class DecoderPool {
-  constructor(size) {
+  constructor() {
     this.workers = [];
     this.fallback = false;
     this.seq = 0;
-    const n = Math.max(1, Math.min(size, (navigator.hardwareConcurrency || 4) - 1 || size));
-    for (let i = 0; i < n; i++) {
-      try {
-        const wk = new Worker("js/decoder-worker.js");
-        this.workers.push(wk);
-      } catch { this.fallback = true; break; }
+    const want = Math.max(1, Math.min(2, (navigator.hardwareConcurrency || 4) - 1));
+    for (let i = 0; i < want; i++) {
+      try { this.workers.push(new Worker("js/decoder-worker.js")); }
+      catch { this.fallback = true; break; }
     }
     if (!this.workers.length) this.fallback = true;
   }
   get size() { return this.fallback ? 0 : this.workers.length; }
-  // jobs: [{data,width,height}] → Promise<(text|null)[]>，保持顺序
+  destroy() {
+    for (const wk of this.workers) { try { wk.terminate(); } catch {} }
+    this.workers = [];
+  }
+  decodeOne(worker, job) {
+    return new Promise((resolve) => {
+      const id = ++this.seq;
+      let settled = false;
+      const onMsg = (e) => {
+        if (e.data.id !== id || settled) return;
+        settled = true;
+        worker.removeEventListener("message", onMsg);
+        clearTimeout(timer);
+        resolve(e.data.text);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        worker.removeEventListener("message", onMsg);
+        resolve(null); // 超时只丢这一格，不影响其它帧
+      }, 800);
+      worker.addEventListener("message", onMsg);
+      // 不用 transfer：复制更安全，避免 buffer 所有权问题导致异常
+      try { worker.postMessage({ id, data: job.data, width: job.width, height: job.height }); }
+      catch { clearTimeout(timer); worker.removeEventListener("message", onMsg); resolve(null); }
+    });
+  }
+  // jobs: [{data,width,height}] → (text|null)[]，按 worker 轮转分发后并行等待
   async decode(jobs) {
     if (this.fallback) return jobs.map((j) => decodeSync(j.data, j.width, j.height));
-    // 简单轮转：每个 job 取一个 worker，并行 await
-    return Promise.all(jobs.map((j, idx) => new Promise((resolve) => {
-      const wk = this.workers[idx % this.workers.length];
-      const id = ++this.seq;
-      const done = (e) => { if (e.data.id === id) { wk.removeEventListener("message", done); resolve(e.data.text); } };
-      wk.addEventListener("message", done);
-      // transfer 走 buffer（本帧不再复用）
-      wk.postMessage({ id, data: j.data, width: j.width, height: j.height }, [j.data.buffer]);
-      setTimeout(() => { wk.removeEventListener("message", done); resolve(null); }, 1500); // 单格超时保护
-    })));
+    const results = new Array(jobs.length).fill(null);
+    await Promise.all(jobs.map((j, idx) =>
+      this.decodeOne(this.workers[idx % this.workers.length], j).then((t) => { results[idx] = t; })
+    ));
+    return results;
   }
 }
 let pool = null;
@@ -227,26 +266,33 @@ let pool = null;
 // 在中心 ROI 内按 n×n 切格，逐格解码，返回本帧读到的所有文本（异步并行）
 async function decodeFrame(v, ctx, n) {
   const w = v.videoWidth, h = v.videoHeight;
-  // ROI 取短边的 0.92（矩阵尽量占满，格更大更清晰）；单码沿用 0.82
+  if (!w || !h) return [];                 // 元数据未就绪
   const ratio = n >= 2 ? 0.92 : 0.82;
   const side = Math.round(Math.min(w, h) * ratio);
+  if (!Number.isFinite(side) || side < 64) return [];
   const sx = Math.round((w - side) / 2);
   const sy = Math.round((h - side) / 2);
   ctx.canvas.width = side; ctx.canvas.height = side;
-  ctx.drawImage(v, sx, sy, side, side, 0, 0, side, side);
+  try {
+    ctx.drawImage(v, sx, sy, side, side, 0, 0, side, side);
+  } catch { return []; }
 
-  // 组装待解码区域
   const rects = n === 1
     ? [{ sx: 0, sy: 0, size: side }]
     : matrixCells(side / 2, side / 2, side, n, 0);
-  const jobs = rects.map((c) => {
-    const img = ctx.getImageData(c.sx, c.sy, c.size, c.size);
-    return { data: img.data, width: c.size, height: c.size };
-  });
+  let jobs;
+  try {
+    jobs = rects.map((c) => {
+      const img = ctx.getImageData(c.sx, c.sy, c.size, c.size);
+      return { data: img.data, width: c.size, height: c.size };
+    });
+  } catch { return []; }
 
-  if (!pool || pool.size !== (n === 1 ? 1 : n * n)) pool = new DecoderPool(n === 1 ? 1 : n * n);
-  const results = await pool.decode(jobs);
-  return results.filter(Boolean);
+  if (!pool) pool = new DecoderPool();
+  let results;
+  try { results = await pool.decode(jobs); }
+  catch { return []; }
+  return (results || []).filter(Boolean);
 }
 
 async function loop() {
@@ -254,7 +300,6 @@ async function loop() {
   const w = v.videoWidth, h = v.videoHeight;
   if (w && h && !busy) {
     busy = true;
-    // 未锁定时先按单码找 META；锁定后按 META 里的矩阵阶数切格
     const n = meta ? matrixN : 1;
     try {
       const texts = await decodeFrame(v, ctx, n);
@@ -264,8 +309,8 @@ async function loop() {
       scans++;
       const now = performance.now();
       if (now - lastFpsT > 1000) { $("fps").textContent = scans; scans = 0; lastFpsT = now; }
-    } catch (e) { /* 单帧异常忽略，继续下一帧 */ }
-    busy = false;
+    } catch (e) { /* 单帧异常忽略 */ }
+    finally { busy = false; }   // 关键：任何路径都复位，防止一次异常后永久不解码
   }
   raf = requestAnimationFrame(loop);
 }
