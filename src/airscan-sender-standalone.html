@@ -33,7 +33,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.3.0</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.4.0</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -43,10 +43,10 @@
 
     <label class="row">② 扫描密度（越低越好扫；先从 V15 试）</label>
     <select id="density">
-      <option value="10">V10 · 约 178B/帧（最稳，慢）</option>
-      <option value="15" selected>V15 · 约 364B/帧（推荐起步）</option>
-      <option value="20">V20 · 约 619B/帧</option>
-      <option value="25">V25 · 约 928B/帧（要求屏幕清晰）</option>
+      <option value="10">V10 · 约 241B/帧（最稳，慢）</option>
+      <option value="15" selected>V15 · 约 483B/帧（推荐起步）</option>
+      <option value="20">V20 · 约 809B/帧</option>
+      <option value="25">V25 · 约 1213B/帧（要求屏幕清晰）</option>
     </select>
 
     <label class="row">②.5 同屏码数（矩阵，手机正对屏幕；越高速越要稳）</label>
@@ -2610,11 +2610,28 @@ const RAW_CAPACITY = {
 };
 const EC_INDEX = { L: 0, M: 1, Q: 2, H: 3 };
 
+// ---------- QR Alphanumeric 模式容量（字符数，L 级，V10-40） ----------
+// Base45(RFC9285) 字符集恰为 QR Alphanumeric 字符集子集，每字符 5.5bit（vs Byte 8bit），
+// 故 Base45 串走 Alphanumeric 模式，等效比 Base64+Byte 省约 23% 容量（实测，见 base45 探针）。
+// 数值由 qrcode-generator 二分探测并锁定 getModuleCount 得到（库自身权威，非手填）。
+const ALPHANUM_CAPACITY_L = {
+  10:395,11:468,12:535,13:619,14:667,15:758,16:854,17:938,18:1046,19:1153,
+  20:1249,21:1352,22:1460,23:1588,24:1704,25:1853,26:1990,27:2132,28:2223,29:2369,
+  30:2520,31:2677,32:2840,33:3009,34:3183,35:3351,36:3537,37:3729,38:3927,39:4087,40:4296,
+};
+
 // 某版本/纠错级的 QR Byte 模式原始字节容量
 function rawQrCapacity(version, ecLevel = "L") {
   const row = RAW_CAPACITY[version];
   if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
   return row[EC_INDEX[ecLevel]];
+}
+
+// 某版本 L 级的 Alphanumeric 字符容量（wire Base45 用）
+function alphaCapacity(version) {
+  const c = ALPHANUM_CAPACITY_L[version];
+  if (!c) throw new Error(`Alphanumeric 容量表未覆盖版本 ${version}`);
+  return c;
 }
 
 // QR 内可承载的【数据帧 payload】安全上限 = 字节容量 - 帧头 - CRC。
@@ -2637,6 +2654,16 @@ function wirePayloadCapacity(version, ecLevel = "L") {
   // wire 长度 = 前缀6 + base64(4*ceil(frameBytes/3)) + 后缀2
   const b64Budget = row[EC_INDEX[ecLevel]] - 2 - 8; // 扣余量与前后缀
   const maxFrameBytes = Math.floor(b64Budget / 4) * 3; // base64 长度按 4 向上取整
+  const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
+  return Math.max(0, maxFrameBytes - fixed);
+}
+
+// wire（Base45 + QR Alphanumeric 模式）下，给定 QR 版本反推单帧净 payload 字节上限。
+// wire 文本就是纯 Base45（无定界符）：每 2 字节↔3 字符，尾单字节 2 字符。
+// 留 6 字符安全余量（抗字符计数/库容差），按 2 字节对齐向下取整。
+function wirePayloadCapacityB45(version) {
+  const b45Budget = alphaCapacity(version) - 6;
+  const maxFrameBytes = Math.floor(b45Budget / 3) * 2; // 每 3 字符对应 2 字节
   const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
   return Math.max(0, maxFrameBytes - fixed);
 }
@@ -2703,6 +2730,78 @@ async function decompress(data, flags) {
     return gunzipBytes(data);
   }
   return new Uint8Array(data);
+}
+
+/* ===== base45.js ===== */
+// base45.js — RFC 9285 Base45 编解码
+// 字符集 45 个可打印 ASCII（jsQR 文本模式无损）。编码规则（严格 RFC 9285）：
+//   每 2 字节 [a,b]，n=a*256+b (0..65535) → 3 字符：n%45, floor(n/45)%45, floor(n/45/45)
+//   末尾若剩 1 字节 a (0..255)     → 2 字符：a%45, floor(a/45)
+// 故解码可从字符串长度无歧义还原字节数（len%3===2 表示末尾有个单字节组）。
+//
+// 收益：QR Byte 模式下约 2.25 字符/2字节 → 膨胀约 +12.5%（Base64 是 +33%），
+// 同样容量的 QR 能多装约 18% 的帧字节（1.333/1.125≈1.185）。
+
+const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+const BASE = 45;
+
+const DECODE_TABLE = (() => {
+  const t = new Int8Array(256).fill(-1);
+  for (let i = 0; i < ALPHABET.length; i++) t[ALPHABET.charCodeAt(i)] = i;
+  return t;
+})();
+function encodeBase45(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < u8.length; i += 2) {
+    if (i + 1 < u8.length) {
+      const n = u8[i] * 256 + u8[i + 1];
+      const c = n % BASE;
+      const d = Math.floor(n / BASE) % BASE;
+      const e = Math.floor(n / (BASE * BASE));
+      out += ALPHABET[c] + ALPHABET[d] + ALPHABET[e];
+    } else {
+      const n = u8[i];
+      out += ALPHABET[n % BASE] + ALPHABET[Math.floor(n / BASE)];
+    }
+  }
+  return out;
+}
+function decodeBase45(str) {
+  if (typeof str !== "string") throw new Error("Base45 输入必须是字符串");
+  const rem = str.length % 3;
+  if (rem === 1) throw new Error("Base45 长度非法（余 1）");
+
+  // 字节数：整组 3 字符→2 字节；若末尾余 2 字符→再 +1 字节
+  const whole = Math.floor(str.length / 3);
+  const hasTail = rem === 2;
+  const out = new Uint8Array(whole * 2 + (hasTail ? 1 : 0));
+  let o = 0, i = 0;
+
+  for (let g = 0; g < whole; g++) {
+    const c = val(str, i++);
+    const d = val(str, i++);
+    const e = val(str, i++);
+    const n = c + d * BASE + e * BASE * BASE;
+    if (n > 65535) throw new Error("Base45 双字节组溢出");
+    out[o++] = Math.floor(n / 256);
+    out[o++] = n % 256;
+  }
+  if (hasTail) {
+    const c = val(str, i++);
+    const d = val(str, i++);
+    const n = c + d * BASE;
+    if (n > 255) throw new Error("Base45 单字节组溢出");
+    out[o++] = n;
+  }
+  return out;
+}
+
+function val(str, i) {
+  const code = str.charCodeAt(i);
+  const v = code < 256 ? DECODE_TABLE[code] : -1;
+  if (v < 0) throw new Error("Base45 含非法字符");
+  return v;
 }
 
 /* ===== lt-code.js ===== */
@@ -2919,6 +3018,37 @@ function paintMatrix(ctx, canvasSize, n, qrs) {
   }
 }
 
+// 高性能版本（浏览器）：每个 QR 先画到一张离屏小 canvas（逐模块），再用 drawImage
+// 缩放到目标格。GPU 加速的 drawImage 比在主画布上做 N²×模块² 次 fillRect 快一个量级，
+// 3×3 高帧率时尤其明显。node 环境无 document，用 paintMatrix。
+function paintMatrixFast(ctx, canvasSize, n, qrs, doc = (typeof document !== "undefined" ? document : null)) {
+  if (!doc) return paintMatrix(ctx, canvasSize, n, qrs);
+  const cellPx = canvasSize / n;
+  const margin = 4;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvasSize, canvasSize);
+  ctx.imageSmoothingEnabled = false;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const qr = qrs[i * n + j];
+      if (!qr) continue;
+      const modules = qr.getModuleCount();
+      const inner = modules + margin * 2;
+      // 离屏按模块 1:1 画（inner×inner 像素），再缩放到格内
+      const off = doc.createElement("canvas");
+      off.width = inner; off.height = inner;
+      const octx = off.getContext("2d");
+      octx.fillStyle = "#fff"; octx.fillRect(0, 0, inner, inner);
+      octx.fillStyle = "#000";
+      for (let r = 0; r < modules; r++)
+        for (let c = 0; c < modules; c++)
+          if (qr.isDark(r, c)) octx.fillRect(c + margin, r + margin, 1, 1);
+      const target = Math.floor(cellPx);
+      ctx.drawImage(off, 0, 0, inner, inner, j * cellPx, i * cellPx, target, target);
+    }
+  }
+}
+
 // 接收端：给定矩阵阶数 n 与中心方形 ROI 边长（摄像头像素），
 // 返回 n*n 个 {sx, sy, size} 源裁剪矩形（行优先），供 drawImage 逐格裁出解码。
 // 中心点 (cx, cy)。默认不内缩（insetRatio=0）：接收端按完整等分格裁剪，
@@ -3053,68 +3183,100 @@ function bytesEqual(a, b) {
 /* ===== wire-codec.js ===== */
 // wire-codec.js — QR 物理层适配：把协议二进制帧 ↔ jsQR 能无损承载的文本
 //
-// 关键背景（2026-10-22 实测）：jsQR 内部按 UTF-8 解码，裸二进制帧(含 0x00/非UTF8)
-// 会被丢弃返回空串；而 Base64 字符集(A-Za-z0-9+/=)走 QR Byte 模式可被 jsQR 无损还原。
-// 故网页链路在 QR 边界统一做 Base64；P4 客户端(zbar 原始字节)可跳过本层（enc=raw）。
+// 关键背景：jsQR 按 UTF-8/文本返回，裸二进制帧(含 0x00/非UTF8)会丢。必须编码成可打印文本。
 //
-// 为让接收端能从一帧扫码文本里稳定切出 payload，每条扫码行用前缀/帧界定：
-//   "ASQP3." + base64(payload) + ".E"
-// 前缀含协议魔数与协议大版本（PROTO_VER=3，M2 LT 喷泉码）；base64 字符集不含 '.'，故 '.' 可作安全定界。
-// v2(ASQP2.) 为 M1 定长分片，v1(ASQP1.) 为无 type 字段的缺陷版，均不再识别。
+// 当前默认（v0.4.0+）：**Base45(RFC9285) + QR Alphanumeric 模式**
+//   Base45 字符集恰好是 QR Alphanumeric 字符集（每 QR 字符 5.5bit，Byte 模式 8bit），
+//   实测比“Base64 + Byte 模式”省约 23% 容量（tests/base45 光学探针）。
+//   wire 形态 = Base45(frameBytes) 本身，【无额外定界符】——Alphanumeric 集只有 45 个字符、
+//   全被 Base45 用满，没有“空闲字符”当分隔符。jsQR 一次只返回一个 QR 的内容，接收端直接
+//   对扫到的串做 Base45 解码，靠帧内 MAGIC("ASQP"→Base45 "SB8QCA") + 帧形状校验锁定。
+//
+// 向后兼容：仍识别旧 Base64+Byte 形态 "ASQP3.<b64>.E"（v0.2/0.3），按特征分流。
+// v1/v2 更早的版本不再识别。
 
 
-const PREFIX = "ASQP3."; // MAGIC ASCII("ASQP") + 协议版本3 + '.'
-const SUFFIX = ".E";
 
-function bytesToB64(u8) {
-  if (typeof Buffer !== "undefined") return Buffer.from(u8).toString("base64");
-  let bin = "";
-  for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
-  return btoa(bin);
-}
-function b64ToBytes(s) {
-  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(s, "base64"));
-  const bin = atob(s);
-  const u = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-  return u;
+// Base45(MAGIC "ASQP") 的固定前缀，用于快速锚定本协议帧
+const B45_MAGIC_PREFIX = "SB8QCA";
+
+function hasMagic(bytes) {
+  return bytes.length >= 4 &&
+    bytes[0] === MAGIC[0] && bytes[1] === MAGIC[1] &&
+    bytes[2] === MAGIC[2] && bytes[3] === MAGIC[3];
 }
 
-// 二进制帧 → 送进 QR 的文本
+// 二进制帧 → 送进 QR 的纯 Base45 文本（QR 端用 Alphanumeric 模式渲染）
 function encodeWire(frameBytes) {
-  return PREFIX + bytesToB64(frameBytes) + SUFFIX;
+  return encodeBase45(frameBytes);
 }
 
-// 扫码得到的文本 → 二进制帧；不是本协议帧返回 null。
-// 容忍画面里读到的空白/前后噪声，只截取首个完整 PREFIX...SUFFIX。
+// 告诉发送端：encodeWire 产出的文本要用哪种 QR 模式
+const WIRE_QR_MODE = "Alphanumeric";
+
+// 扫码文本 → 二进制帧；无法识别返回 null。先试 Base45（当前），再试旧 Base64。
 function decodeWire(text) {
   if (!text || typeof text !== "string") return null;
-  const s = text.replace(/\s+/g, "");
-  const start = s.indexOf(PREFIX);
-  if (start < 0) return null;
-  const body = s.slice(start + PREFIX.length);
-  const end = body.indexOf(".");
-  if (end < 0) return null;
-  const b64 = body.slice(0, end);
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return null;
-  try {
-    const bytes = b64ToBytes(b64);
-    // 二次确认魔数，防止误命中
-    if (bytes.length < 4 ||
-        bytes[0] !== MAGIC[0] || bytes[1] !== MAGIC[1] ||
-        bytes[2] !== MAGIC[2] || bytes[3] !== MAGIC[3]) return null;
-    return bytes;
-  } catch {
-    return null;
-  }
+  return tryBase45(text) || tryBase64(text);
 }
 
-// 估算给定原始字节帧编码成 wire 文本后的长度（选 QR 版本用）。
+function tryBase45(text) {
+  const anchor = text.indexOf(B45_MAGIC_PREFIX);
+  if (anchor < 0) return null;
+  const okCh = (ch) => /[0-9A-Z $%*+\-./:]/.test(ch);
+  // 向右扩展连续 Base45 字符
+  let end = anchor + B45_MAGIC_PREFIX.length;
+  while (end < text.length && okCh(text[end])) end++;
+  // 向左收集合法字符（可能有画面噪声粘连；真实无噪声时 start=0 即帧首）
+  let start = anchor;
+  while (start > 0 && okCh(text[start - 1])) start--;
+
+  // 合法 Base45 长度：3 的倍数（偶数字节）或余 2（末尾单字节组）；余 1 非法。
+  // 在窗口内尝试不同左偏移（偶数个字符，保证魔数仍落在字节边界）与右截断，
+  // 取首个解出合法帧的结果（容忍前后噪声粘连）。
+  for (let ls = anchor; ls >= start; ls--) {
+    if ((anchor - ls) % 2 !== 0) continue;
+    for (let trim = 0; trim <= 10; trim++) {
+      const len = end - ls - trim;
+      if (len < B45_MAGIC_PREFIX.length || len % 3 === 1) continue;
+      try {
+        const bytes = decodeBase45(text.slice(ls, ls + len));
+        if (hasMagic(bytes) && frameShapeOk(bytes)) return bytes;
+      } catch { /* 下一候选 */ }
+    }
+  }
+  return null;
+}
+
+// 粗校帧形状：至少够帧头，ver/type 合理
+function frameShapeOk(bytes) {
+  if (bytes.length < 6) return false;
+  const ver = bytes[4], type = bytes[5];
+  if (ver < 1 || ver > 10) return false;
+  if (type !== 1 && type !== 2) return false;
+  return true;
+}
+
+function tryBase64(text) {
+  const m = text.match(/ASQP3\.([A-Za-z0-9+/]+={0,2})\./);
+  if (!m) return null;
+  try {
+    const bin = atob(m[1]);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return hasMagic(u) ? u : null;
+  } catch { return null; }
+}
+
+// 估算 Base45 wire 文本长度（选 QR 版本用）：每 2 字节 3 字符，尾单字节 2 字符
 function wireTextLen(frameByteLen) {
-  return PREFIX.length + SUFFIX.length + Math.ceil(frameByteLen / 3) * 4;
+  const pairs = Math.floor(frameByteLen / 2);
+  const tail = frameByteLen % 2;
+  return pairs * 3 + (tail ? 2 : 0);
 }
 
 /* ===== sender page ===== */
+
 
 
 
@@ -3143,7 +3305,7 @@ $("start").addEventListener("click", async () => {
   qrVersion = parseInt($("density").value, 10);
   matrixN = parseInt($("matrix").value, 10);
   // LT 等长块：用精确容量反推 blockSize（wire base64 膨胀已计入）
-  const blockSize = wirePayloadCapacity(qrVersion, "L");
+  const blockSize = wirePayloadCapacityB45(qrVersion);
   if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
     packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff), matrixN });
@@ -3151,8 +3313,8 @@ $("start").addEventListener("click", async () => {
 
   // 越界硬校验：任意 LT 帧定长（payload=blockSize），抽一帧确认 wire 不超 QR 容量
   const probe = encodeWire(makeLtFrame(packed, 1));
-  if (probe.length > rawQrCapacity(qrVersion, "L")) {
-    return err(`编码越界：${probe.length} > V${qrVersion} 容量，请降密度`);
+  if (probe.length > alphaCapacity(qrVersion)) {
+    return err(`编码越界：${probe.length} > V${qrVersion} 字母数字容量，请降密度`);
   }
 
   $("setup").style.display = "none";
@@ -3162,12 +3324,28 @@ $("start").addEventListener("click", async () => {
   const fps = parseInt($("fps").value, 10);
   drawFrame();
   timer = setInterval(drawFrame, 1000 / fps);
+  requestWakeLock();
+});
+
+// 屏幕常亮：播放期间阻止息屏（不支持就静默跳过，不影响功能）
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  } catch { wakeLock = null; }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+}
+// 从后台切回前台时自动重新申请（Wake Lock 在页面隐藏后会失效）
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && timer) requestWakeLock();
 });
 
 // 造一个已 addData+make 的 qrcode 实例
 function makeQr(text) {
   const qr = qrcode(qrVersion, "L");
-  qr.addData(text, "Byte");
+  qr.addData(text, WIRE_QR_MODE); // Base45 → QR Alphanumeric 模式（5.5bit/字符，省容量）
   qr.make();
   return qr;
 }
@@ -3180,14 +3358,14 @@ function drawFrame() {
 
   if (isMeta) {
     const qrs = new Array(n2).fill(encodeWire(packed.metaFrame)).map(makeQr);
-    paintMatrix(ctx, cv.width, matrixN, qrs);
+    paintMatrixFast(ctx, cv.width, matrixN, qrs);
     $("mType").textContent = "META";
     $("mSeq").textContent = "—";
   } else {
     const qrs = [];
     const firstSeed = seed;
     for (let k = 0; k < n2; k++) { qrs.push(makeQr(encodeWire(makeLtFrame(packed, seed)))); seed++; }
-    paintMatrix(ctx, cv.width, matrixN, qrs);
+    paintMatrixFast(ctx, cv.width, matrixN, qrs);
     sentPackets += n2;
     $("mType").textContent = "DATA";
     $("mSeq").textContent = `LT#${firstSeed}~${seed - 1}`;
@@ -3207,6 +3385,7 @@ $("stop").addEventListener("click", () => {
   $("stage").style.display = "none";
   $("setup").style.display = "block";
   sentPackets = 0;
+  releaseWakeLock();
 });
 
 </script>

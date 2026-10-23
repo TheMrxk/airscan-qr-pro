@@ -18,7 +18,7 @@ SRC = ROOT / "src"
 OUT = ROOT / "release"
 
 # 业务模块依赖顺序（被依赖的在前）
-MODULES = ["protocol.js", "compressor.js", "lt-code.js", "matrix.js", "packet.js", "wire-codec.js"]
+MODULES = ["protocol.js", "compressor.js", "base45.js", "lt-code.js", "matrix.js", "packet.js", "wire-codec.js"]
 
 
 def read(p: Path) -> str:

@@ -13,7 +13,7 @@ const { paintMatrix, matrixCells } = await import("../src/js/matrix.js");
 const { packFile, makeLtFrame, unpackMeta, unpackData, LTReceiver } = await import("../src/js/packet.js");
 const { encodeWire, decodeWire } = await import("../src/js/wire-codec.js");
 const {
-  wirePayloadCapacity, peekFrameType, decodeMatrixN, FRAME_TYPE_META, FRAME_TYPE_DATA,
+  wirePayloadCapacityB45, peekFrameType, decodeMatrixN, FRAME_TYPE_META, FRAME_TYPE_DATA,
 } = await import("../src/js/protocol.js");
 
 // node 端没有 canvas，用 ImageData 风格缓冲区模拟 ctx
@@ -51,7 +51,7 @@ function makeCanvasCtx(size) {
 function buildQrs(texts, version) {
   return texts.map((t) => {
     const q = qrcode(version, "L");
-    q.addData(t, "Byte"); q.make();
+    q.addData(t, "Alphanumeric"); q.make();
     return q;
   });
 }
@@ -76,7 +76,7 @@ async function matrixTransfer(sizeKB, version, n, cellLoss, seed) {
   const data = new Uint8Array(sizeKB * 1024);
   for (let i = 0; i < data.length; i += 65536)
     webcrypto.getRandomValues(data.subarray(i, Math.min(i + 65536, data.length)));
-  const bs = wirePayloadCapacity(version, "L");
+  const bs = wirePayloadCapacityB45(version);
   const packed = await packFile({ name: "m.bin", data, blockSize: bs, taskId: 3, forceRaw: true, matrixN: n });
   const recv = new LTReceiver(packed.meta);
 

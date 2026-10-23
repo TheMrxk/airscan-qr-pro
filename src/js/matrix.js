@@ -39,6 +39,37 @@ export function paintMatrix(ctx, canvasSize, n, qrs) {
   }
 }
 
+// 高性能版本（浏览器）：每个 QR 先画到一张离屏小 canvas（逐模块），再用 drawImage
+// 缩放到目标格。GPU 加速的 drawImage 比在主画布上做 N²×模块² 次 fillRect 快一个量级，
+// 3×3 高帧率时尤其明显。node 环境无 document，用 paintMatrix。
+export function paintMatrixFast(ctx, canvasSize, n, qrs, doc = (typeof document !== "undefined" ? document : null)) {
+  if (!doc) return paintMatrix(ctx, canvasSize, n, qrs);
+  const cellPx = canvasSize / n;
+  const margin = 4;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvasSize, canvasSize);
+  ctx.imageSmoothingEnabled = false;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const qr = qrs[i * n + j];
+      if (!qr) continue;
+      const modules = qr.getModuleCount();
+      const inner = modules + margin * 2;
+      // 离屏按模块 1:1 画（inner×inner 像素），再缩放到格内
+      const off = doc.createElement("canvas");
+      off.width = inner; off.height = inner;
+      const octx = off.getContext("2d");
+      octx.fillStyle = "#fff"; octx.fillRect(0, 0, inner, inner);
+      octx.fillStyle = "#000";
+      for (let r = 0; r < modules; r++)
+        for (let c = 0; c < modules; c++)
+          if (qr.isDark(r, c)) octx.fillRect(c + margin, r + margin, 1, 1);
+      const target = Math.floor(cellPx);
+      ctx.drawImage(off, 0, 0, inner, inner, j * cellPx, i * cellPx, target, target);
+    }
+  }
+}
+
 // 接收端：给定矩阵阶数 n 与中心方形 ROI 边长（摄像头像素），
 // 返回 n*n 个 {sx, sy, size} 源裁剪矩形（行优先），供 drawImage 逐格裁出解码。
 // 中心点 (cx, cy)。默认不内缩（insetRatio=0）：接收端按完整等分格裁剪，

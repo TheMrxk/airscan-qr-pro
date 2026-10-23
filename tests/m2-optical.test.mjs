@@ -6,7 +6,7 @@ const qrcode = require("../src/vendor/qrcode.js");
 const jsQR = require("../src/vendor/jsQR.min.js");
 const { packFile, makeLtFrame, unpackMeta, unpackData, LTReceiver } = await import("../src/js/packet.js");
 const { encodeWire, decodeWire } = await import("../src/js/wire-codec.js");
-const { wirePayloadCapacity, peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA } = await import("../src/js/protocol.js");
+const { wirePayloadCapacityB45, peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA } = await import("../src/js/protocol.js");
 
 function render(qr, scale=8, margin=4) {
   const n=qr.getModuleCount(),size=(n+margin*2)*scale;
@@ -15,7 +15,7 @@ function render(qr, scale=8, margin=4) {
   return {d,size};
 }
 function opticalRead(text){
-  const q=qrcode(0,"L");q.addData(text,"Byte");q.make();
+  const q=qrcode(0,"L");q.addData(text,"Alphanumeric");q.make();
   const im=render(q);
   const r=jsQR(im.d,im.size,im.size,{inversionAttempts:"attemptBoth"});
   return r?r.data:null;
@@ -26,7 +26,7 @@ async function run(sizeKB, version, loss, seed) {
   const data=new Uint8Array(sizeKB*1024);
   // 分块填真随机（getRandomValues 单次上限 65536）
   for(let i=0;i<data.length;i+=65536)webcrypto.getRandomValues(data.subarray(i,Math.min(i+65536,data.length)));
-  const bs=wirePayloadCapacity(version,"L");
+  const bs=wirePayloadCapacityB45(version);
   const packed=await packFile({name:"rand.bin",data,blockSize:bs,taskId:7,forceRaw:true});
   const K=packed.meta.K;
   const recv=new LTReceiver(packed.meta);

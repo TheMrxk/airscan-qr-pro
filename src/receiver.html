@@ -58,7 +58,7 @@
 <body>
 <div class="wrap">
   <h1>📥 AirScan-QR Pro · 接收端</h1>
-  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.3.0</span></div>
+  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.4.0</span></div>
 
   <div class="card">
     <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
@@ -85,6 +85,9 @@
       已解出源块 <b id="got">0</b>/<span id="total">?</span>　已收有效包 <b id="uniq">0</b>
       CRC失败 <b id="bad">0</b>　
       扫描 <b id="fps">0</b> 帧/秒
+    </div>
+    <div class="stat" id="rateLine" style="margin-top:6px">
+      速率 <b id="rate">—</b>　预计剩余 <b id="eta">—</b>
     </div>
   </div>
 
@@ -116,6 +119,7 @@ let badCrc = 0, scans = 0, lastFpsT = performance.now();
 let uniquePackets = 0;
 let matrixN = 1;          // 锁定 META 后得知的一屏码数（1/2/3）
 let busy = false;         // 上一帧还没解码完就跳过，不堆积
+let lockT = 0, lastDecoded = 0, lastRateT = 0; // 速率/ETA 统计
 
 $("startCam").addEventListener("click", async () => {
   try {
@@ -265,6 +269,7 @@ function fmtSize(bytes) {
 
 function lockMeta(m) {
   meta = m; recv = new LTReceiver(m); uniquePackets = 0; badCrc = 0;
+  lockT = performance.now(); lastDecoded = 0; lastRateT = lockT;
   matrixN = decodeMatrixN(m.flags);
   $("reticle").setAttribute("data-n", String(matrixN));
   const ntxt = matrixN >= 2 ? ` ${matrixN}×${matrixN} 矩阵` : "";
@@ -282,6 +287,41 @@ function refresh() {
   if (!meta || !recv) return;
   $("got").textContent = recv.decodedBlocks;
   $("prog").style.width = (recv.progress * 100) + "%";
+  updateRate();
+}
+
+// 速率与预计剩余：用“已解出的压缩字节 / 墙钟时间”，按近 1 秒增量平滑。
+// LT 前期可能长时间 0 块后突然成批解出，故同时给整体平均速率兜底。
+function updateRate() {
+  const now = performance.now();
+  const decodedBytes = recv.decodedBlocks * meta.blockSize;
+  const elapsed = (now - lockT) / 1000;
+  if (elapsed < 0.5) return;
+  // 整体平均有效速率（按压缩载荷字节，真实文件速率解压后另计）
+  const avgBps = decodedBytes / elapsed;
+  $("rate").textContent = fmtRate(avgBps);
+  // ETA：剩余源块 / 近 1 秒解块速率；无增量时退回平均
+  const remainBlocks = meta.K - recv.decodedBlocks;
+  let blocksPerSec;
+  const dt = (now - lastRateT) / 1000;
+  if (dt >= 1) {
+    blocksPerSec = (recv.decodedBlocks - lastDecoded) / dt;
+    lastDecoded = recv.decodedBlocks; lastRateT = now;
+  }
+  if (remainBlocks <= 0) { $("eta").textContent = "完成"; return; }
+  const useRate = (blocksPerSec && blocksPerSec > 0.05) ? blocksPerSec : recv.decodedBlocks / elapsed;
+  if (useRate > 0) {
+    const eta = remainBlocks / useRate;
+    $("eta").textContent = eta > 60 ? Math.ceil(eta / 60) + " 分钟" : Math.ceil(eta) + " 秒";
+  } else {
+    $("eta").textContent = "收集中…";
+  }
+}
+
+function fmtRate(bps) {
+  if (bps >= 1024 * 1024) return (bps / 1024 / 1024).toFixed(2) + " MB/s";
+  if (bps >= 1024) return (bps / 1024).toFixed(1) + " KB/s";
+  return Math.round(bps) + " B/s";
 }
 
 async function finish() {

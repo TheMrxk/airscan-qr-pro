@@ -36,7 +36,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.3.0</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.4.0</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -46,10 +46,10 @@
 
     <label class="row">② 扫描密度（越低越好扫；先从 V15 试）</label>
     <select id="density">
-      <option value="10">V10 · 约 178B/帧（最稳，慢）</option>
-      <option value="15" selected>V15 · 约 364B/帧（推荐起步）</option>
-      <option value="20">V20 · 约 619B/帧</option>
-      <option value="25">V25 · 约 928B/帧（要求屏幕清晰）</option>
+      <option value="10">V10 · 约 241B/帧（最稳，慢）</option>
+      <option value="15" selected>V15 · 约 483B/帧（推荐起步）</option>
+      <option value="20">V20 · 约 809B/帧</option>
+      <option value="25">V25 · 约 1213B/帧（要求屏幕清晰）</option>
     </select>
 
     <label class="row">②.5 同屏码数（矩阵，手机正对屏幕；越高速越要稳）</label>
@@ -84,8 +84,9 @@
 <script type="module">
 import { packFile, makeLtFrame } from "../js/packet.js";
 import { encodeWire } from "../js/wire-codec.js";
-import { wirePayloadCapacity, rawQrCapacity } from "../js/protocol.js";
-import { paintMatrix } from "../js/matrix.js";
+import { wirePayloadCapacityB45, alphaCapacity } from "../js/protocol.js";
+import { WIRE_QR_MODE } from "../js/wire-codec.js";
+import { paintMatrixFast } from "../js/matrix.js";
 
 const $ = (id) => document.getElementById(id);
 let timer = null, packed = null, seed = 1, frameCount = 0, matrixN = 1, qrVersion = 15;
@@ -111,7 +112,7 @@ $("start").addEventListener("click", async () => {
   qrVersion = parseInt($("density").value, 10);
   matrixN = parseInt($("matrix").value, 10);
   // LT 等长块：用精确容量反推 blockSize（wire base64 膨胀已计入）
-  const blockSize = wirePayloadCapacity(qrVersion, "L");
+  const blockSize = wirePayloadCapacityB45(qrVersion);
   if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
     packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff), matrixN });
@@ -119,8 +120,8 @@ $("start").addEventListener("click", async () => {
 
   // 越界硬校验：任意 LT 帧定长（payload=blockSize），抽一帧确认 wire 不超 QR 容量
   const probe = encodeWire(makeLtFrame(packed, 1));
-  if (probe.length > rawQrCapacity(qrVersion, "L")) {
-    return err(`编码越界：${probe.length} > V${qrVersion} 容量，请降密度`);
+  if (probe.length > alphaCapacity(qrVersion)) {
+    return err(`编码越界：${probe.length} > V${qrVersion} 字母数字容量，请降密度`);
   }
 
   $("setup").style.display = "none";
@@ -130,12 +131,28 @@ $("start").addEventListener("click", async () => {
   const fps = parseInt($("fps").value, 10);
   drawFrame();
   timer = setInterval(drawFrame, 1000 / fps);
+  requestWakeLock();
+});
+
+// 屏幕常亮：播放期间阻止息屏（不支持就静默跳过，不影响功能）
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  } catch { wakeLock = null; }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+}
+// 从后台切回前台时自动重新申请（Wake Lock 在页面隐藏后会失效）
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && timer) requestWakeLock();
 });
 
 // 造一个已 addData+make 的 qrcode 实例
 function makeQr(text) {
   const qr = qrcode(qrVersion, "L");
-  qr.addData(text, "Byte");
+  qr.addData(text, WIRE_QR_MODE); // Base45 → QR Alphanumeric 模式（5.5bit/字符，省容量）
   qr.make();
   return qr;
 }
@@ -148,14 +165,14 @@ function drawFrame() {
 
   if (isMeta) {
     const qrs = new Array(n2).fill(encodeWire(packed.metaFrame)).map(makeQr);
-    paintMatrix(ctx, cv.width, matrixN, qrs);
+    paintMatrixFast(ctx, cv.width, matrixN, qrs);
     $("mType").textContent = "META";
     $("mSeq").textContent = "—";
   } else {
     const qrs = [];
     const firstSeed = seed;
     for (let k = 0; k < n2; k++) { qrs.push(makeQr(encodeWire(makeLtFrame(packed, seed)))); seed++; }
-    paintMatrix(ctx, cv.width, matrixN, qrs);
+    paintMatrixFast(ctx, cv.width, matrixN, qrs);
     sentPackets += n2;
     $("mType").textContent = "DATA";
     $("mSeq").textContent = `LT#${firstSeed}~${seed - 1}`;
@@ -175,6 +192,7 @@ $("stop").addEventListener("click", () => {
   $("stage").style.display = "none";
   $("setup").style.display = "block";
   sentPackets = 0;
+  releaseWakeLock();
 });
 </script>
 </body>

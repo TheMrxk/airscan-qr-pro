@@ -234,11 +234,28 @@ const RAW_CAPACITY = {
 };
 const EC_INDEX = { L: 0, M: 1, Q: 2, H: 3 };
 
+// ---------- QR Alphanumeric 模式容量（字符数，L 级，V10-40） ----------
+// Base45(RFC9285) 字符集恰为 QR Alphanumeric 字符集子集，每字符 5.5bit（vs Byte 8bit），
+// 故 Base45 串走 Alphanumeric 模式，等效比 Base64+Byte 省约 23% 容量（实测，见 base45 探针）。
+// 数值由 qrcode-generator 二分探测并锁定 getModuleCount 得到（库自身权威，非手填）。
+const ALPHANUM_CAPACITY_L = {
+  10:395,11:468,12:535,13:619,14:667,15:758,16:854,17:938,18:1046,19:1153,
+  20:1249,21:1352,22:1460,23:1588,24:1704,25:1853,26:1990,27:2132,28:2223,29:2369,
+  30:2520,31:2677,32:2840,33:3009,34:3183,35:3351,36:3537,37:3729,38:3927,39:4087,40:4296,
+};
+
 // 某版本/纠错级的 QR Byte 模式原始字节容量
 export function rawQrCapacity(version, ecLevel = "L") {
   const row = RAW_CAPACITY[version];
   if (!row) throw new Error(`不支持的 QR 版本 ${version}`);
   return row[EC_INDEX[ecLevel]];
+}
+
+// 某版本 L 级的 Alphanumeric 字符容量（wire Base45 用）
+export function alphaCapacity(version) {
+  const c = ALPHANUM_CAPACITY_L[version];
+  if (!c) throw new Error(`Alphanumeric 容量表未覆盖版本 ${version}`);
+  return c;
 }
 
 // QR 内可承载的【数据帧 payload】安全上限 = 字节容量 - 帧头 - CRC。
@@ -261,6 +278,16 @@ export function wirePayloadCapacity(version, ecLevel = "L") {
   // wire 长度 = 前缀6 + base64(4*ceil(frameBytes/3)) + 后缀2
   const b64Budget = row[EC_INDEX[ecLevel]] - 2 - 8; // 扣余量与前后缀
   const maxFrameBytes = Math.floor(b64Budget / 4) * 3; // base64 长度按 4 向上取整
+  const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
+  return Math.max(0, maxFrameBytes - fixed);
+}
+
+// wire（Base45 + QR Alphanumeric 模式）下，给定 QR 版本反推单帧净 payload 字节上限。
+// wire 文本就是纯 Base45（无定界符）：每 2 字节↔3 字符，尾单字节 2 字符。
+// 留 6 字符安全余量（抗字符计数/库容差），按 2 字节对齐向下取整。
+export function wirePayloadCapacityB45(version) {
+  const b45Budget = alphaCapacity(version) - 6;
+  const maxFrameBytes = Math.floor(b45Budget / 3) * 2; // 每 3 字符对应 2 字节
   const fixed = DATA_HDR_LEN + DATA_CRC_LEN;
   return Math.max(0, maxFrameBytes - fixed);
 }
