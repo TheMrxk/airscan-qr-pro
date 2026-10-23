@@ -21,12 +21,15 @@
   .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
   video { width:100%; border-radius:12px; background:#000; display:none; }
   canvas.hidden { display:none; }
-  /* 取景器：视频容器内叠一个方形瞄准框，引导把二维码放进框里 */
-  .view { position:relative; width:100%; display:none; }
-  .view video { display:block; width:100%; }
+  /* 顶栏：标题 + 返回按钮 */
+  .topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .back-btn { width:auto; padding:8px 14px; font-size:13px; white-space:nowrap; }
+  /* 取景器：手机竖屏限高，避免把进度挤出首屏 */
+  .view { position:relative; width:100%; display:none; border-radius:12px; overflow:hidden; background:#000; }
+  .view video { display:block; width:100%; height:44vh; min-height:240px; max-height:340px; object-fit:cover; }
   .reticle {
     position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
-    width:78%; aspect-ratio:1/1; pointer-events:none;
+    width:74%; aspect-ratio:1/1; pointer-events:none;
     border:2px solid rgba(124,58,237,.9); border-radius:16px;
     box-shadow:0 0 0 9999px rgba(0,0,0,.28);
   }
@@ -57,8 +60,14 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>📥 AirScan-QR Pro · 接收端</h1>
-  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.4.1</span></div>
+  <div class="topbar">
+    <div>
+      <h1>📥 AirScan-QR Pro · 接收端</h1>
+      <div class="sub" style="margin-bottom:0">对准发送屏幕 · 自动收集 · SHA-256 · <span data-app-version>v0.4.2</span></div>
+    </div>
+    <button class="back-btn ghost" id="backBtn" style="display:none">← 返回</button>
+  </div>
+  <div style="height:12px"></div>
 
   <div class="card">
     <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
@@ -87,7 +96,7 @@
       扫描 <b id="fps">0</b> 帧/秒
     </div>
     <div class="stat" id="rateLine" style="margin-top:6px">
-      速率 <b id="rate">—</b>　预计剩余 <b id="eta">—</b>
+      速率 <b id="rate">—</b>　剩余 <b id="eta">—</b>　用时 <b id="elapsed">0s</b>
     </div>
   </div>
 
@@ -120,6 +129,7 @@ let uniquePackets = 0;
 let matrixN = 1;          // 锁定 META 后得知的一屏码数（1/2/3）
 let busy = false;         // 上一帧还没解码完就跳过，不堆积
 let lockT = 0, lastDecoded = 0, lastRateT = 0; // 速率/ETA 统计
+let elapsedTimer = null;
 
 $("startCam").addEventListener("click", async () => {
   try {
@@ -132,11 +142,46 @@ $("startCam").addEventListener("click", async () => {
     await v.play();
     $("startCam").style.display = "none";
     $("view").style.display = "block";
+    $("backBtn").style.display = "inline-block";
+    startElapsed();
     loop();
   } catch (e) {
     $("phase").textContent = "无法打开摄像头：" + e.message + "（需 HTTPS 或 localhost）";
   }
 });
+
+// 返回：关摄像头、停解码与计时、复位界面到初始
+function stopAll() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+}
+$("backBtn").addEventListener("click", () => {
+  stopAll();
+  $("view").style.display = "none";
+  $("backBtn").style.display = "none";
+  $("done").style.display = "none";
+  $("startCam").style.display = "block";
+  meta = null; recv = null; uniquePackets = 0; badCrc = 0; scans = 0;
+  $("phase").textContent = "等待信号…";
+  $("task").textContent = "—";
+  $("got").textContent = "0"; $("total").textContent = "?";
+  $("uniq").textContent = "0"; $("bad").textContent = "0"; $("fps").textContent = "0";
+  $("rate").textContent = "—"; $("eta").textContent = "—"; $("elapsed").textContent = "0s";
+  $("prog").style.width = "0%";
+  $("reticle").setAttribute("data-n", "1");
+});
+
+// 扫描用时（从开摄像头起累计）
+function startElapsed() {
+  const t0 = performance.now();
+  $("elapsed").textContent = "0s";
+  if (elapsedTimer) clearInterval(elapsedTimer);
+  elapsedTimer = setInterval(() => {
+    const s = Math.floor((performance.now() - t0) / 1000);
+    $("elapsed").textContent = s >= 60 ? Math.floor(s/60) + "m" + (s%60) + "s" : s + "s";
+  }, 500);
+}
 
 // 主线程解码（Worker 不可用时回退）
 function decodeSync(imageData, w, h) {
@@ -332,11 +377,15 @@ async function finish() {
     const url = URL.createObjectURL(blob);
     const a = $("download");
     a.href = url; a.download = meta.name;
-    $("doneInfo").innerHTML = `文件 <b>${meta.name}</b> · ${fmtSize(raw.length)} · 用 ${uniquePackets} 个 LT 包解出 ${meta.K} 块 · SHA-256 校验通过`;
+    const used = $("elapsed").textContent;
+    $("doneInfo").innerHTML = `文件 <b>${meta.name}</b> · ${fmtSize(raw.length)} · ${used} 完成 · 用 ${uniquePackets} 个 LT 包解出 ${meta.K} 块 · SHA-256 校验通过`;
     $("done").style.display = "block";
+    $("done").scrollIntoView({ behavior: "smooth", block: "nearest" });
     $("phase").textContent = "✅ 完成";
+    $("eta").textContent = "完成";
     $("camHint").textContent = "接收完成，可点保存文件";
     cancelAnimationFrame(raf);
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   } catch (e) {
     $("phase").textContent = "重组失败：" + e.message + "（继续采集即可，喷泉码会补齐）";
     // 失败不复位解码器：继续收包后 BP 可能解出更多块
