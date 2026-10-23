@@ -1,6 +1,6 @@
 // sw.js — AirScan-QR Pro Service Worker：离线缓存 + PWA 安装能力
 // 纯本地工具，缓存所有静态资源；装好后即使无网络也能打开。
-const CACHE = "airscan-qr-pro-v0.2.0";
+const CACHE = "airscan-qr-pro-v0.3.0";
 const ASSETS = [
   "./",
   "./sender.html",
@@ -10,9 +10,12 @@ const ASSETS = [
   "./vendor/jsQR.min.js",
   "./js/protocol.js",
   "./js/compressor.js",
+  "./js/lt-code.js",
+  "./js/matrix.js",
   "./js/packet.js",
   "./js/qr-encode.js",
   "./js/wire-codec.js",
+  "./js/decoder-worker.js",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
 ];

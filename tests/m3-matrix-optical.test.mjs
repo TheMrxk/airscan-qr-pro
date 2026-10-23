@@ -13,7 +13,7 @@ const { paintMatrix, matrixCells } = await import("../src/js/matrix.js");
 const { packFile, makeLtFrame, unpackMeta, unpackData, LTReceiver } = await import("../src/js/packet.js");
 const { encodeWire, decodeWire } = await import("../src/js/wire-codec.js");
 const {
-  wirePayloadCapacity, peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA,
+  wirePayloadCapacity, peekFrameType, decodeMatrixN, FRAME_TYPE_META, FRAME_TYPE_DATA,
 } = await import("../src/js/protocol.js");
 
 // node 端没有 canvas，用 ImageData 风格缓冲区模拟 ctx
@@ -77,7 +77,7 @@ async function matrixTransfer(sizeKB, version, n, cellLoss, seed) {
   for (let i = 0; i < data.length; i += 65536)
     webcrypto.getRandomValues(data.subarray(i, Math.min(i + 65536, data.length)));
   const bs = wirePayloadCapacity(version, "L");
-  const packed = await packFile({ name: "m.bin", data, blockSize: bs, taskId: 3, forceRaw: true });
+  const packed = await packFile({ name: "m.bin", data, blockSize: bs, taskId: 3, forceRaw: true, matrixN: n });
   const recv = new LTReceiver(packed.meta);
 
   // 让单格物理尺寸足够大（jsQR 可解）：整图 = N² 个格，每格约 360px
@@ -98,14 +98,19 @@ async function matrixTransfer(sizeKB, version, n, cellLoss, seed) {
     const ctx = makeCanvasCtx(FULL);
     paintMatrix(ctx, FULL, n, qrs);
     let locked = false;
+    let lockedMeta = null;
     for (const rect of cells) {
       const scan = readCell(ctx.d, FULL, rect);
       if (scan) {
         const f = decodeWire(scan);
-        if (f && peekFrameType(f) === FRAME_TYPE_META && unpackMeta(f)) { locked = true; }
+        if (f && peekFrameType(f) === FRAME_TYPE_META && unpackMeta(f)) {
+          locked = true; lockedMeta = unpackMeta(f);
+        }
       }
     }
     assert.ok(locked, `N=${n} META 矩阵格至少一格应锁定`);
+    // META 必须携带正确的矩阵阶数（接收端据此自动切格）
+    assert.equal(decodeMatrixN(lockedMeta.flags), n);
   }
 
   // 后续 tick：每 tick N² 个连续 seed 的 DATA 包

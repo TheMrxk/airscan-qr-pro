@@ -25,6 +25,21 @@ export const FLAG_COMPRESS_GZIP = 0x01;
 export const FLAG_COMPRESS_RAW = 0x00;
 export const FLAG_RESERVED_ZSTD = 0x02;
 
+// flags 高 4 位（bit4-7）携带矩阵阶数 n（1/2/3，即 1×1、2×2、3×3）。
+// 接收端从 META 自动得知一屏有几码、按 n×n 切格，无需用户在手机端手选。
+// 低 4 位留给压缩等标志；旧版忽略高位（天然按 1×1 处理）。
+export function encodeMatrixFlag(n) {
+  const order = n === 1 ? 0 : n; // 1×1 → 0，2×2 → 2，3×3 → 3
+  return (order & 0x0f) << 4;
+}
+export function decodeMatrixN(flags) {
+  const order = (flags >>> 4) & 0x0f;
+  return order === 0 ? 1 : order; // 0 或 1 都视为单码
+}
+export function compressFlags(flags) {
+  return flags & 0x0f; // 压缩相关位
+}
+
 // ---------- CRC32（IEEE 802.3 多项式 0xEDB88320，查表） ----------
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);

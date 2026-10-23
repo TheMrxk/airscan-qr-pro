@@ -36,7 +36,7 @@
 <body>
 <div class="wrap">
   <h1>📤 AirScan-QR Pro · 发送端</h1>
-  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.2.0</span></div>
+  <div class="sub">物理隔离单向传输 · 纯本地运行 · gzip压缩 · M1单码 · <span data-app-version>v0.3.0</span></div>
 
   <div class="card" id="setup">
     <label class="row">① 选择文件（或粘贴文本）</label>
@@ -50,6 +50,13 @@
       <option value="15" selected>V15 · 约 364B/帧（推荐起步）</option>
       <option value="20">V20 · 约 619B/帧</option>
       <option value="25">V25 · 约 928B/帧（要求屏幕清晰）</option>
+    </select>
+
+    <label class="row">②.5 同屏码数（矩阵，手机正对屏幕；越高速越要稳）</label>
+    <select id="matrix">
+      <option value="1" selected>1×1 单码（最稳，任意角度）</option>
+      <option value="2">2×2 四码（约 3~4 倍速度，需正对）</option>
+      <option value="3">3×3 九码（最快，需正对+清晰屏）</option>
     </select>
 
     <label class="row">③ 播放帧率（帧/秒，手机识别跟得上再调高）<span id="fpsv">8</span> fps</label>
@@ -78,10 +85,11 @@
 import { packFile, makeLtFrame } from "../js/packet.js";
 import { encodeWire } from "../js/wire-codec.js";
 import { wirePayloadCapacity, rawQrCapacity } from "../js/protocol.js";
+import { paintMatrix } from "../js/matrix.js";
 
 const $ = (id) => document.getElementById(id);
-let timer = null, packed = null, seed = 1, frameCount = 0;
-const META_EVERY = 24;   // 每播放 N 个数据帧插播一次 META（帮晚到的接收端锁定任务）
+let timer = null, packed = null, seed = 1, frameCount = 0, matrixN = 1, qrVersion = 15;
+const META_EVERY = 24;   // 每播放 N 个数据【tick】整屏插播一次 META（帮晚到的接收端锁定）
 
 $("fps").addEventListener("input", e => $("fpsv").textContent = e.target.value);
 
@@ -100,64 +108,66 @@ $("start").addEventListener("click", async () => {
     name = "note_" + Date.now().toString().slice(-5) + ".txt";
   } else { return err("请选择文件或输入文本"); }
 
-  const version = parseInt($("density").value, 10);
+  qrVersion = parseInt($("density").value, 10);
+  matrixN = parseInt($("matrix").value, 10);
   // LT 等长块：用精确容量反推 blockSize（wire base64 膨胀已计入）
-  const blockSize = wirePayloadCapacity(version, "L");
+  const blockSize = wirePayloadCapacity(qrVersion, "L");
   if (blockSize <= 0) return err("该密度容量异常，换低档位");
   try {
-    packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff) });
+    packed = await packFile({ name, data, blockSize, taskId: Math.floor(Math.random()*0xffff), matrixN });
   } catch (e) { return err("打包失败：" + e.message); }
+
+  // 越界硬校验：任意 LT 帧定长（payload=blockSize），抽一帧确认 wire 不超 QR 容量
+  const probe = encodeWire(makeLtFrame(packed, 1));
+  if (probe.length > rawQrCapacity(qrVersion, "L")) {
+    return err(`编码越界：${probe.length} > V${qrVersion} 容量，请降密度`);
+  }
 
   $("setup").style.display = "none";
   $("stage").style.display = "block";
-  $("mTask").textContent = `${name} · ${(data.length/1024).toFixed(1)}KB · K=${packed.meta.K} · V${version} · LT喷泉`;
+  $("mTask").textContent = `${name} · ${(data.length/1024).toFixed(1)}KB · K=${packed.meta.K} · V${qrVersion} · ${matrixN}×${matrixN}矩阵 · LT喷泉`;
   seed = 1; frameCount = 0; sentPackets = 0;
   const fps = parseInt($("fps").value, 10);
   drawFrame();
   timer = setInterval(drawFrame, 1000 / fps);
 });
 
-function drawFrame() {
-  // META 周期插播；其余为 LT 数据帧，seed 单调递增（无限喷泉流）
-  const isMeta = frameCount % (META_EVERY + 1) === 0;
-  let text, type, seq;
-  if (isMeta) {
-    text = encodeWire(packed.metaFrame); type = "META"; seq = -1;
-  } else {
-    text = encodeWire(makeLtFrame(packed, seed)); type = "DATA"; seq = seed; seed++;
-  }
-  frameCount++;
-
-  // 越界硬校验（理论上 wirePayloadCapacity 已保证，双保险不放坏码）
-  const version = parseInt($("density").value, 10);
-  if (text.length > rawQrCapacity(version, "L")) {
-    err(`编码越界：${text.length} > V${version} 容量，请降密度`); stop_(); return;
-  }
-
-  const qr = qrcode(version, "L");
+// 造一个已 addData+make 的 qrcode 实例
+function makeQr(text) {
+  const qr = qrcode(qrVersion, "L");
   qr.addData(text, "Byte");
   qr.make();
-  paint(qr);
-  $("mType").textContent = type;
-  $("mSeq").textContent = type === "DATA" ? `LT#${seq}` : "—";
-  if (type === "DATA") updateStats(seq);
+  return qr;
 }
 
-function stop_(){ clearInterval(timer); timer = null; }
-
-function paint(qr) {
+function drawFrame() {
   const cv = $("player"), ctx = cv.getContext("2d");
-  const n = qr.getModuleCount(), margin = 4, cell = Math.floor(cv.width / (n + margin * 2));
-  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
-  ctx.fillStyle = "#000";
-  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
-    if (qr.isDark(r, c)) ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
+  const n2 = matrixN * matrixN;
+  // 整屏要么全 META、要么全 DATA（接收端按格切分时类型一致）
+  const isMeta = frameCount % (META_EVERY + 1) === 0;
+
+  if (isMeta) {
+    const qrs = new Array(n2).fill(encodeWire(packed.metaFrame)).map(makeQr);
+    paintMatrix(ctx, cv.width, matrixN, qrs);
+    $("mType").textContent = "META";
+    $("mSeq").textContent = "—";
+  } else {
+    const qrs = [];
+    const firstSeed = seed;
+    for (let k = 0; k < n2; k++) { qrs.push(makeQr(encodeWire(makeLtFrame(packed, seed)))); seed++; }
+    paintMatrix(ctx, cv.width, matrixN, qrs);
+    sentPackets += n2;
+    $("mType").textContent = "DATA";
+    $("mSeq").textContent = `LT#${firstSeed}~${seed - 1}`;
+    updateStats();
+  }
+  frameCount++;
 }
 
 let sentPackets = 0;
 function updateStats() {
-  sentPackets++;
-  $("stats").innerHTML = `文件 <b>${packed.meta.name}</b>　源块 K=<b>${packed.meta.K}</b><br>已播放 LT 包 <b>${sentPackets}</b>（接收端收够约 ${Math.ceil(packed.meta.K*1.5)}~${Math.ceil(packed.meta.K*2)} 个即自动完成）<br>压缩 <b>${packed.meta.flags & 1 ? "gzip" : "raw"}</b> · 漏扫无需重传`;
+  const need = `${Math.ceil(packed.meta.K*1.5)}~${Math.ceil(packed.meta.K*2)}`;
+  $("stats").innerHTML = `文件 <b>${packed.meta.name}</b>　源块 K=<b>${packed.meta.K}</b><br>已播放 LT 包 <b>${sentPackets}</b>（${matrixN}×${matrixN} 矩阵，每屏 ${matrixN*matrixN} 包；收够约 ${need} 个自动完成）<br>压缩 <b>${packed.meta.flags & 1 ? "gzip" : "raw"}</b> · 漏扫无需重传`;
 }
 
 $("stop").addEventListener("click", () => {

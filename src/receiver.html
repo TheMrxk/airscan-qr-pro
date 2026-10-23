@@ -33,6 +33,15 @@
   .reticle::before { content:""; position:absolute; inset:-2px; border-radius:16px;
     border:3px dashed rgba(255,255,255,.55); animation:none; }
   .reticle.good { border-color:#22c55e; }
+  /* 矩阵引导网格线（JS 按阶数 data-n 画出）*/
+  .grid-lines { position:absolute; inset:0; pointer-events:none; }
+  .grid-lines i { position:absolute; background:rgba(255,255,255,.35); display:none; }
+  .reticle[data-n="2"] .g-v1{display:block;left:50%;top:0;width:1px;height:100%;}
+  .reticle[data-n="2"] .g-h1{display:block;top:50%;left:0;height:1px;width:100%;}
+  .reticle[data-n="3"] .g-v1{display:block;left:33.33%;top:0;width:1px;height:100%;}
+  .reticle[data-n="3"] .g-v2{display:block;left:66.66%;top:0;width:1px;height:100%;}
+  .reticle[data-n="3"] .g-h1{display:block;top:33.33%;left:0;height:1px;width:100%;}
+  .reticle[data-n="3"] .g-h2{display:block;top:66.66%;left:0;height:1px;width:100%;}
   .hint { position:absolute; left:0; right:0; bottom:10px; text-align:center;
     color:#fff; font-size:12px; text-shadow:0 1px 3px rgba(0,0,0,.8); pointer-events:none; }
   button { font-size:14px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; padding:12px 16px; cursor:pointer; width:100%; }
@@ -49,13 +58,18 @@
 <body>
 <div class="wrap">
   <h1>📥 AirScan-QR Pro · 接收端</h1>
-  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.2.0</span></div>
+  <div class="sub">摄像头对准发送屏幕 · 自动收集帧 · SHA-256 校验 · M1 · <span data-app-version>v0.3.0</span></div>
 
   <div class="card">
     <button class="primary" id="startCam">🎥 开启摄像头开始接收</button>
     <div class="view" id="view">
       <video id="video" playsinline muted></video>
-      <div class="reticle" id="reticle"></div>
+      <div class="reticle" id="reticle" data-n="1">
+        <div class="grid-lines">
+          <i class="g-v1"></i><i class="g-v2"></i>
+          <i class="g-h1"></i><i class="g-h2"></i>
+        </div>
+      </div>
       <div class="hint" id="camHint">把二维码整个放进方框，保持稳定</div>
     </div>
     <canvas class="hidden" id="canvas"></canvas>
@@ -93,12 +107,15 @@ if ("serviceWorker" in navigator) {
 <script type="module">
 import { unpackMeta, unpackData, LTReceiver } from "../js/packet.js";
 import { decodeWire } from "../js/wire-codec.js";
-import { peekFrameType, FRAME_TYPE_META, FRAME_TYPE_DATA } from "../js/protocol.js";
+import { peekFrameType, decodeMatrixN, FRAME_TYPE_META, FRAME_TYPE_DATA } from "../js/protocol.js";
+import { matrixCells } from "../js/matrix.js";
 
 const $ = (id) => document.getElementById(id);
 let stream = null, raf = null, meta = null, recv = null;
 let badCrc = 0, scans = 0, lastFpsT = performance.now();
 let uniquePackets = 0;
+let matrixN = 1;          // 锁定 META 后得知的一屏码数（1/2/3）
+let busy = false;         // 上一帧还没解码完就跳过，不堆积
 
 $("startCam").addEventListener("click", async () => {
   try {
@@ -117,70 +134,127 @@ $("startCam").addEventListener("click", async () => {
   }
 });
 
-function loop() {
+// 主线程解码（Worker 不可用时回退）
+function decodeSync(imageData, w, h) {
+  try {
+    const r = jsQR(imageData, w, h, { inversionAttempts: "dontInvert" });
+    return r && r.data ? r.data : null;
+  } catch { return null; }
+}
+
+// Worker 解码池：矩阵时多格并行，避免 jsQR 单线程阻塞 UI；失败回退主线程。
+class DecoderPool {
+  constructor(size) {
+    this.workers = [];
+    this.fallback = false;
+    this.seq = 0;
+    const n = Math.max(1, Math.min(size, (navigator.hardwareConcurrency || 4) - 1 || size));
+    for (let i = 0; i < n; i++) {
+      try {
+        const wk = new Worker("js/decoder-worker.js");
+        this.workers.push(wk);
+      } catch { this.fallback = true; break; }
+    }
+    if (!this.workers.length) this.fallback = true;
+  }
+  get size() { return this.fallback ? 0 : this.workers.length; }
+  // jobs: [{data,width,height}] → Promise<(text|null)[]>，保持顺序
+  async decode(jobs) {
+    if (this.fallback) return jobs.map((j) => decodeSync(j.data, j.width, j.height));
+    // 简单轮转：每个 job 取一个 worker，并行 await
+    return Promise.all(jobs.map((j, idx) => new Promise((resolve) => {
+      const wk = this.workers[idx % this.workers.length];
+      const id = ++this.seq;
+      const done = (e) => { if (e.data.id === id) { wk.removeEventListener("message", done); resolve(e.data.text); } };
+      wk.addEventListener("message", done);
+      // transfer 走 buffer（本帧不再复用）
+      wk.postMessage({ id, data: j.data, width: j.width, height: j.height }, [j.data.buffer]);
+      setTimeout(() => { wk.removeEventListener("message", done); resolve(null); }, 1500); // 单格超时保护
+    })));
+  }
+}
+let pool = null;
+
+// 在中心 ROI 内按 n×n 切格，逐格解码，返回本帧读到的所有文本（异步并行）
+async function decodeFrame(v, ctx, n) {
+  const w = v.videoWidth, h = v.videoHeight;
+  // ROI 取短边的 0.92（矩阵尽量占满，格更大更清晰）；单码沿用 0.82
+  const ratio = n >= 2 ? 0.92 : 0.82;
+  const side = Math.round(Math.min(w, h) * ratio);
+  const sx = Math.round((w - side) / 2);
+  const sy = Math.round((h - side) / 2);
+  ctx.canvas.width = side; ctx.canvas.height = side;
+  ctx.drawImage(v, sx, sy, side, side, 0, 0, side, side);
+
+  // 组装待解码区域
+  const rects = n === 1
+    ? [{ sx: 0, sy: 0, size: side }]
+    : matrixCells(side / 2, side / 2, side, n, 0);
+  const jobs = rects.map((c) => {
+    const img = ctx.getImageData(c.sx, c.sy, c.size, c.size);
+    return { data: img.data, width: c.size, height: c.size };
+  });
+
+  if (!pool || pool.size !== (n === 1 ? 1 : n * n)) pool = new DecoderPool(n === 1 ? 1 : n * n);
+  const results = await pool.decode(jobs);
+  return results.filter(Boolean);
+}
+
+async function loop() {
   const v = $("video"), cv = $("canvas"), ctx = cv.getContext("2d", { willReadFrequently: true });
   const w = v.videoWidth, h = v.videoHeight;
-  if (w && h) {
-    // 中心方形 ROI：只裁取景框区域送 jsQR，大幅降低解码像素数、提速、抗背景干扰。
-    // 与 CSS 瞄准框 78% 宽度对齐（留余量取 82%，防止手抖出框）。
-    const side = Math.round(Math.min(w, h) * 0.82);
-    const sx = Math.round((w - side) / 2);
-    const sy = Math.round((h - side) / 2);
-    cv.width = side; cv.height = side;
-    ctx.drawImage(v, sx, sy, side, side, 0, 0, side, side);
-    scans++;
-    const img = ctx.getImageData(0, 0, side, side);
-    const res = jsQR(img.data, side, side, { inversionAttempts: "dontInvert" });
-    if (res && res.data) { handleText(res.data); flashReticle(true); }
-    else flashReticle(false);
-    // fps
-    const now = performance.now();
-    if (now - lastFpsT > 1000) {
-      $("fps").textContent = scans;
-      scans = 0; lastFpsT = now;
-    }
+  if (w && h && !busy) {
+    busy = true;
+    // 未锁定时先按单码找 META；锁定后按 META 里的矩阵阶数切格
+    const n = meta ? matrixN : 1;
+    try {
+      const texts = await decodeFrame(v, ctx, n);
+      let any = false;
+      for (const t of texts) { if (handleText(t)) any = true; }
+      flashReticle(any);
+      scans++;
+      const now = performance.now();
+      if (now - lastFpsT > 1000) { $("fps").textContent = scans; scans = 0; lastFpsT = now; }
+    } catch (e) { /* 单帧异常忽略，继续下一帧 */ }
+    busy = false;
   }
   raf = requestAnimationFrame(loop);
 }
 
 function flashReticle(good) {
-  const el = $("reticle");
-  el.classList.toggle("good", good);
+  $("reticle").classList.toggle("good", good);
 }
 
+// 返回 true 表示本帧至少识别出一个有效包（用于绿框反馈）
 function handleText(text) {
-  // 同一条线里可能含一个帧；decodeWire 截取首个完整帧
   const frame = decodeWire(text);
-  if (!frame) return;
-
-  // 按帧类型严格分流，杜绝 DATA 误当 META（v0.1.0 真机乱码根因）
+  if (!frame) return false;
   const type = peekFrameType(frame);
 
-  // 尚未锁定任务：只接受 META
   if (!meta) {
     if (type !== FRAME_TYPE_META) {
       $("phase").textContent = "发现二维码，等待 META 帧…";
-      return;
+      return true;
     }
     const m = unpackMeta(frame);
-    if (m && m.ver >= 2) { lockMeta(m); }
-    else $("phase").textContent = "发现二维码，等待 META 帧…";
-    return;
+    if (m && m.ver >= 2) { lockMeta(m); return true; }
+    $("phase").textContent = "发现二维码，等待 META 帧…";
+    return true;
   }
 
-  // 已锁定：META 帧重复广播时忽略（也可在此支持任务切换，M1 先锁定首个）
-  if (type === FRAME_TYPE_META) return;
-  if (type !== FRAME_TYPE_DATA) return;
+  if (type === FRAME_TYPE_META) return true;   // 重复 META
+  if (type !== FRAME_TYPE_DATA) return false;
 
   const d = unpackData(frame);
-  if (!d) { badCrc++; $("bad").textContent = badCrc; return; }
-  if (d.taskId !== meta.taskId) return;        // 别的任务，忽略
-  if (recv.seenPacket(d.frameSeq)) return;     // 重复 LT 包（同 seed），忽略
+  if (!d) { badCrc++; $("bad").textContent = badCrc; return false; }
+  if (d.taskId !== meta.taskId) return false;
+  if (recv.seenPacket(d.frameSeq)) return true; // 重复 LT 包，仍算识别成功
   recv.feed(d.frameSeq, d.payload, d.taskId);
   uniquePackets++;
   $("uniq").textContent = uniquePackets;
   refresh();
   if (recv.done) finish();
+  return true;
 }
 
 function fmtSize(bytes) {
@@ -191,11 +265,16 @@ function fmtSize(bytes) {
 
 function lockMeta(m) {
   meta = m; recv = new LTReceiver(m); uniquePackets = 0; badCrc = 0;
-  $("phase").textContent = "已锁定任务，LT 喷泉收集中…（漏扫无需重传）";
+  matrixN = decodeMatrixN(m.flags);
+  $("reticle").setAttribute("data-n", String(matrixN));
+  const ntxt = matrixN >= 2 ? ` ${matrixN}×${matrixN} 矩阵` : "";
+  $("phase").textContent = `已锁定任务，LT 喷泉收集中…（漏扫无需重传）${ntxt}`;
   const safeName = m.name || "(未命名)";
-  $("task").textContent = `${safeName} · ${fmtSize(m.fileLen)} · ${m.K} 源块 · ${m.flags & 1 ? "gzip" : "raw"}`;
+  $("task").textContent = `${safeName} · ${fmtSize(m.fileLen)} · ${m.K} 源块${ntxt} · ${m.flags & 1 ? "gzip" : "raw"}`;
   $("total").textContent = m.K;
-  $("camHint").textContent = "保持对准，绿色方框表示已识别，收够自动完成";
+  $("camHint").textContent = matrixN >= 2
+    ? `把${matrixN}×${matrixN}个码整个对准网格，手机与屏幕尽量平行，绿色即识别`
+    : "保持对准，绿色方框表示已识别，收够自动完成";
   refresh();
 }
 

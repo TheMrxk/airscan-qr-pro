@@ -4,6 +4,42 @@
 版本号唯一来源是仓库根目录 `VERSION`，用 `python3 tools/sync_version.py` 同步到页面/manifest/SW，
 发版步骤见《开发文档.md》§11。标签打在可真机验收的提交上。
 
+## [v0.3.0] — 2026-10-23 · M3 多码矩阵双端落地（手机端 ×4/×9 提速）
+
+### 背景
+开哥确认**接收设备是手机、目标文件 >1MB**。P4 屏录/桌面客户端路线对手机不成立
+（getDisplayMedia 仅桌面浏览器支持），故手机摄像头链路的最优解是把 M3 多码矩阵做到双端：
+一屏 2×2/3×3 个 QR 并行 + LT 喷泉，理论吞吐 ×4/×9。
+
+### 新增
+- **发送端矩阵档位**：设置页可选 1×1 / 2×2 / 3×3；`paintMatrix`（matrix.js）同屏渲染
+  N² 个码，整屏同步（全 META 或全 DATA，绝不混播），每 tick 消费 N² 个递增 seed；
+  canvas 单格带 quiet zone 与邻格隔离。
+- **接收端自动矩阵识别**：META 的 flags 高 4 位携带矩阵阶数（`encodeMatrixFlag/decodeMatrixN`），
+  手机锁定任务后**无需手选**，自动按 N×N 等分切格（matrixCells）并显示网格引导线/对准提示。
+- **Web Worker 解码池**（`js/decoder-worker.js` + DecoderPool）：矩阵各格在后台线程并行
+  jsQR 解码，避免单线程阻塞 UI；按硬件并发数取 worker，单格 1.5s 超时保护，worker 不可用自动回退主线程。
+- 接收 ROI 矩阵时取短边 0.92（格更大更清晰），单码沿用 0.82；busy 锁防帧堆积。
+- sw.js 离线缓存补 lt-code/matrix/decoder-worker。
+
+### 测试（共 44 项，连跑 3 轮稳定）
+- `matrix-flag.test.mjs`：阶数编解码、与 gzip 压缩位互不覆盖（0x31=gzip+3×3）、旧 flags 默认 1×1。
+- `m3-matrix-optical`：2×2(V20,20%丢格)/3×3(V15,30%丢格) 整图切分**真画 QR→jsQR→BP** 字节一致，
+  并断言 META 携带正确阶数。
+- packet LT 往返改确定性 PRNG（消除 Math.random 偶发尾部失败），200KB 用例窗口放宽。
+
+### 待真机标定（诚实边界）
+- 等分切格假设**手机与屏幕尽量平行正对**；倾斜透视会让等分线对不齐格边界。
+  真机若有透视误差，下一版做引导框微调/透视校正（已预留）。
+- 3×3 每格物理 QR 更小，对屏幕清晰度/对焦要求更高；建议回家先 2×2 验证，再上 3×3。
+- Worker transfer 缓冲、单格超时在真机的实际帧率待测速记录。
+
+[Unreleased]: ../../compare/v0.3.0...HEAD
+[v0.3.0]: ../../releases/tag/v0.3.0
+[v0.2.0]: ../../releases/tag/v0.2.0
+[v0.1.1]: ../../releases/tag/v0.1.1
+[v0.1.0]: ../../releases/tag/v0.1.0
+
 ## [v0.2.0] — 2026-10-23 · M2 真·LT 喷泉码（协议 v3）
 
 ### 核心升级：从"定长分片轮播"到"喷泉码"，消灭漏帧交互
@@ -30,12 +66,7 @@
 - 新增 `src/js/matrix.js`：N×N 多码矩阵渲染 `paintMatrix` + 接收等分切格 `matrixCells`。
 - `m3-matrix-optical.test.mjs`：**2×2（V20,20%丢格）与 3×3（V15,30%丢格）整图切分
   光学对拍字节一致**，2×2 传 20 块仅 12 个 tick（吞吐接近 ×4）。
-- 暂不在双端开放矩阵档位：等分切格依赖手机正对屏幕，透视/手抖校正需真机数据（见开发文档待办）。
-
-[Unreleased]: ../../compare/v0.2.0...HEAD
-[v0.2.0]: ../../releases/tag/v0.2.0
-[v0.1.1]: ../../releases/tag/v0.1.1
-[v0.1.0]: ../../releases/tag/v0.1.0
+- 暂不在双端开放矩阵档位：等分切格依赖手机正对屏幕，透视/手抖校正需真机数据（v0.3.0 已落地双端）。
 
 ## [v0.1.1] — 2026-10-23 · M1 真机首测修复（协议 v2，不兼容 v0.1.0）
 

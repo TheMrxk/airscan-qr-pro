@@ -11,6 +11,7 @@
 import {
   buildMetaFrame, parseMetaFrame,
   buildDataFrame, parseDataFrame,
+  encodeMatrixFlag,
 } from "./protocol.js";
 import { compress, decompress } from "./compressor.js";
 import { splitEqual, encodePacket, LTDecoder } from "./lt-code.js";
@@ -31,11 +32,12 @@ async function sha256(bytes) {
 // 不预生成所有帧——LT 包用 makeLtFrame(seed) 现算（无限流）。
 export async function packFile({
   name, data, taskId = null,
-  blockSize, forceRaw = false,
+  blockSize, forceRaw = false, matrixN = 1,
 }) {
   if (!blockSize || blockSize < 1) throw new Error("LT 必须显式给 blockSize（按 QR 密度反推）");
   const raw = data instanceof Uint8Array ? data : new Uint8Array(data);
-  const { flags, data: payloadData } = await compress(raw, { forceRaw });
+  const { flags: compFlags, data: payloadData } = await compress(raw, { forceRaw });
+  const flags = (compFlags & 0x0f) | encodeMatrixFlag(matrixN); // 低4位压缩 + 高4位矩阵阶数
 
   const { blocks, K } = splitEqual(payloadData, blockSize);
   const tId = taskId == null ? Math.floor(Math.random() * 0xffff) : taskId & 0xffff;

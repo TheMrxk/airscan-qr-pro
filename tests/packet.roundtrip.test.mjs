@@ -5,9 +5,21 @@ import { packFile, makeLtFrame, unpackMeta, unpackData, LTReceiver } from "../sr
 import { compress, decompress, supportsCompressionStream } from "../src/js/compressor.js";
 import { wirePayloadCapacity } from "../src/js/protocol.js";
 
-// 模拟"发送端无限播 + 接收端持续收"：从 seed=1 产生包，按 lossRate 丢，喂 LTReceiver，
-// 收够自动 done。返回 {receiver, meta, sent, received}。
-async function receive(name, data, { blockSize, lossRate = 0, maxWindowK = 6, seedStart = 1, shuffle = false } = {}) {
+// 确定性 PRNG（测试可复现，不用 Math.random 避免偶发）
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 模拟真机"发送端无限播 + 接收端持续收"：每个包独立按 lossRate 丢，收够自动 done。
+// maxWindowK 是宽松上限（防死循环），不是固定窗口——LT 是概率解码，这样断言才稳定。
+// 返回 {receiver, meta, received}。
+async function receive(name, data, { blockSize, lossRate = 0, maxWindowK = 6, seedStart = 1, shuffle = false, rngSeed = 42 } = {}) {
   const packed = await packFile({ name, data, taskId: 42, blockSize });
   const meta = unpackMeta(packed.metaFrame);
   assert.ok(meta, "meta 帧解析失败");
@@ -15,13 +27,21 @@ async function receive(name, data, { blockSize, lossRate = 0, maxWindowK = 6, se
   assert.equal(meta.taskId, 42);
 
   const recv = new LTReceiver(meta);
-  // 收集窗口内的帧（可打乱顺序）
+  const rng = makeRng(rngSeed);
+  const cap = seedStart + Math.ceil(meta.K * maxWindowK);
   const frames = [];
-  for (let s = seedStart; s < seedStart + Math.ceil(meta.K * maxWindowK); s++) {
-    if (Math.random() < lossRate) continue;
+  for (let s = seedStart; s < cap; s++) {
+    if (rng() < lossRate) continue;
     frames.push(makeLtFrame(packed, s));
+    if (frames.length >= meta.K * maxWindowK) break;
   }
-  if (shuffle) frames.sort(() => Math.random() - 0.5);
+  if (shuffle) {
+    const r2 = makeRng(rngSeed ^ 0x9e3779b9);
+    for (let i = frames.length - 1; i > 0; i--) {
+      const j = Math.floor(r2() * (i + 1));
+      [frames[i], frames[j]] = [frames[j], frames[i]];
+    }
+  }
 
   let received = 0;
   for (const f of frames) {
@@ -85,7 +105,7 @@ test("大文件 200KB+ 高冗余，多块 LT 还原", async () => {
   );
   assert.ok(data.length > 200_000);
   const bs = wirePayloadCapacity(25, "L");
-  const { recv, meta } = await receive("big.js", data, { blockSize: bs, lossRate: 0.15, maxWindowK: 3 });
+  const { recv, meta } = await receive("big.js", data, { blockSize: bs, lossRate: 0.15, maxWindowK: 5, shuffle: true, rngSeed: 314 });
   assert.ok(meta.K >= 2, "应切成多块");
   assert.ok(recv.done, `${recv.decodedBlocks}/${meta.K}`);
   assert.deepEqual(Array.from(await recv.assemble()), Array.from(data));
